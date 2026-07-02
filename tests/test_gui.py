@@ -113,6 +113,28 @@ def test_derive_view():
 
 
 # --------------------------------------------------------------------------- #
+# Headless: derive_view manual-resume line                                     #
+# --------------------------------------------------------------------------- #
+
+def test_derive_view_manual():
+    now = 1_000_000.0
+    print("\n[9] derive_view surfaces the manual resume schedule")
+    v = ar.derive_view({"state": "WATCHING"}, now)
+    check(v["manual_resume_at"] is None, "no manual line when unset")
+    check(v["manual_line"] == "", "manual_line empty when unset")
+
+    v = ar.derive_view({"state": "WATCHING", "manual_resume_at": now + 600,
+                        "manual_only": False}, now)
+    check(v["manual_resume_at"] == now + 600, "manual_resume_at surfaced")
+    check("Manual resume" in v["manual_line"], "manual_line names the schedule")
+    check("backstop: auto on" in v["manual_line"], "auto-backstop noted when not manual-only")
+
+    v = ar.derive_view({"state": "WATCHING", "manual_resume_at": now + 600,
+                        "manual_only": True}, now)
+    check("manual-only" in v["manual_line"], "manual-only noted when set")
+
+
+# --------------------------------------------------------------------------- #
 # Headless: WatchStatus request/publish plumbing                              #
 # --------------------------------------------------------------------------- #
 
@@ -199,13 +221,84 @@ def smoke():
     print("  window closed")
 
 
+def smoke_manual():
+    """Drive the GUI manual-resume-time control programmatically: type into the
+    entry, click Set, and prove it writes the shared manual-request file the watch
+    loop consumes; toggle manual-only; then Clear removes it. Auto-closes."""
+    print("\n[SMOKE] GUI manual-resume control: Set writes the manual file, "
+          "Clear removes it")
+    if ar.tk is None:
+        print("  SKIP  tkinter unavailable")
+        return
+    stop = os.path.join(tempfile.gettempdir(), f"ar_smoke_stop2_{os.getpid()}.stop")
+    manual = os.path.join(tempfile.gettempdir(), f"ar_smoke_manual_{os.getpid()}.json")
+    for p in (stop, manual):
+        if os.path.exists(p):
+            os.remove(p)
+
+    shared = ar.WatchStatus()
+    root = ar.tk.Tk()
+    win = ar.StatusWindow(root, shared, stop, manual_file=manual, tick_ms=0)
+    root.after(6000, root.destroy)          # hard backstop
+
+    check(ar.read_manual_request(manual) is None, "manual file absent before Set")
+
+    # Type a relative time and click Set (exactly what the owner does in the GUI).
+    win.var_manual_entry.set("+30m")
+    win.set_manual()
+    root.update()
+    req = ar.read_manual_request(manual)
+    now = time.time()
+    check(req is not None, "Set wrote the manual-request file")
+    check(req and abs(req["resume_at"] - (now + 30 * 60)) < 90,
+          f"scheduled ~+30m from now (got resume_at={req['resume_at'] if req else None})")
+    check(req and req["manual_only"] is False, "manual_only defaults False (auto backstop on)")
+
+    # Toggle manual-only and re-set -> file reflects it.
+    win.var_manual_only.set(1)
+    win.var_manual_entry.set("+45m")
+    win.set_manual()
+    root.update()
+    req = ar.read_manual_request(manual)
+    check(req and req["manual_only"] is True, "manual-only toggle written to file")
+
+    # Status line reflects a scheduled manual time.
+    win.refresh()
+    root.update()
+    check("Manual resume" in win.var_manual_status.get(),
+          f"status line shows the manual schedule (got {win.var_manual_status.get()!r})")
+
+    # An invalid entry shows an error and does NOT overwrite the good schedule.
+    win.var_manual_entry.set("nonsense")
+    win.set_manual()
+    root.update()
+    check(ar.read_manual_request(manual) is not None,
+          "invalid Set does not clobber the existing schedule")
+
+    # Clear removes the file.
+    win.clear_manual()
+    root.update()
+    check(ar.read_manual_request(manual) is None, "Clear removed the manual file")
+
+    root.destroy()
+    for p in (stop, manual):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+    print("  window closed")
+
+
 def main():
     smoke_only = "--smoke" in sys.argv[1:]
     test_format_hms()
     test_derive_view()
     test_watch_status()
+    test_derive_view_manual()
     if smoke_only:
         smoke()
+        smoke_manual()
     print(f"\n==== {_passed} passed, {_failed} failed ====")
     return 1 if _failed else 0
 

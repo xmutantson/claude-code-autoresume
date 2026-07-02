@@ -2,28 +2,48 @@
 
 When a Claude Code session on a Max plan hits a usage limit (the rolling
 **session** window or the **weekly** window), the session stalls until the limit
-resets. `autoresume` polls the **authoritative usage endpoint** to see which
-quota is blocked and exactly **when** it resets, waits until the reset (plus a
-small buffer), **re-confirms the reset was actually applied**, then **types a
-plain-language resume message into the focused Claude Code window and presses
-Enter** — so unattended autonomous work continues on its own.
+resets. `autoresume` polls the **authoritative usage endpoint** on a **fast fixed
+cadence (~30 s)** to see which quota is blocked and exactly **when** it resets,
+**arms** the moment a real hit is observed, then **fires the instant the window
+clears** (or at the reset time) by **typing a plain-language resume message into
+the focused Claude Code window and pressing Enter** — so unattended autonomous
+work continues on its own.
 
 Detection uses the same data source as the **Usage Monitor for Claude**
 (`GET https://api.anthropic.com/api/oauth/usage`); the detection approach is
 adapted from **jens-duttke/usage-monitor-for-claude** (MIT). autoresume is
-self-sufficient (it polls on its own), and **courteous** — if the Usage Monitor
-app is already running it backs off its own polling so it does not double-hit the
-API. A legacy **transcript watcher** remains as a fallback for machines with no
-readable credentials.
+fully self-sufficient — it polls the endpoint **directly and continuously** and
+does **not** depend on the monitor. A legacy **transcript watcher** remains as a
+fallback for machines with no readable credentials.
 
 It replaces a blunt predecessor (see "Replaces the old AHK script" below) that
 blindly pressed Enter at a fixed 1:15 am.
 
-> **Version 0.2.0** — usage-API detection is now the **primary** source
-> (`--source auto` uses it whenever credentials are readable). The transcript
-> watcher is demoted to a documented fallback. This removes the transcript
-> self-contamination false-arm class from the default path entirely: in
-> `--source usage-api` no transcript text is ever read.
+> **Version 0.3.0** — **fast direct polling + an arm-on-hit / fire-on-reset
+> state machine, plus a manual resume-time control.**
+> - **Fast direct polling.** autoresume now polls the usage endpoint **itself,
+>   every ~30 s** (`--poll-interval`), *regardless* of whether the Usage Monitor
+>   app is running. The old ~15-min courtesy backoff is **gone**: with a 15-min
+>   blind gap a limit could be **hit and reset inside one gap**, so the reset was
+>   missed and dead work never resumed. Continuous fast polling closes that hole.
+> - **Arm-on-hit / fire-on-reset.** When a focused limit window is *observed* at
+>   ≥ 100 % (a real **HIT**) autoresume **ARMS** and persists `{armed, window,
+>   resets_at}` to the state file. While armed it keeps polling and **FIRES** the
+>   moment the armed window **clears** (utilization back below the block line) **or**
+>   the reset time is reached — then disarms. It fires **only** if a hit was
+>   observed: a window sitting at 0 % with **no prior observed hit never fires**.
+>   The armed state **survives a restart**, so a reset that lands while the watcher
+>   is briefly down is still picked up on the next poll.
+> - **Manual resume time.** Set an explicit time in the **GUI** ("Resume at
+>   HH:MM" + Set/Clear, with a *manual-only* toggle) or via **`--resume-at`**
+>   (`HH:MM | +Nm | ISO`). It fires at that time regardless of API detection —
+>   handy when an error message already states the reset (“resets 3:10pm”).
+>   Auto-detection stays on as a backstop unless *manual-only* is set.
+>
+> **Version 0.2.0** — usage-API detection became the **primary** source
+> (`--source auto` uses it whenever credentials are readable); the transcript
+> watcher is a documented fallback. In `--source usage-api` no transcript text is
+> ever read, so the transcript self-contamination false-arm class is impossible.
 
 The injected message tells the agent, in the owner's voice:
 
@@ -38,42 +58,51 @@ The injected message tells the agent, in the owner's voice:
 ## How it works
 
 ```
-poll /api/oauth/usage ─▶ blocked? (percent ≥ 100) ─▶ schedule reset_at + buffer
-        ▲                                                          │
-        │                                          re-poll to CONFIRM reset
-        └──────── loop ◀── inject msg+Enter ◀── (utilization dropped) ✓
+poll /api/oauth/usage every ~30s ─▶ blocked? (percent ≥ 100) ─▶ ARM + persist
+        ▲                                                              │
+        │                        keep polling (fire-on-clear)          ▼
+        └── loop ◀ inject msg+Enter ◀ window CLEARED  or  reset time reached ✓
 ```
 
-1. **Poll the usage endpoint.** `GET https://api.anthropic.com/api/oauth/usage`
-   with the OAuth token, on a ~150–180 s cadence (backing off to ~15 min while
-   the Usage Monitor app is running). All credential + network code lives in
-   `usage_api.py`; **the token is never logged, printed, or stored.**
+1. **Poll the usage endpoint — fast and direct.**
+   `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token, on a
+   **fixed ~30 s cadence** (`--poll-interval`), **always** — no monitor-aware
+   backoff. All credential + network code lives in `usage_api.py`; **the token is
+   never logged, printed, or stored.**
 
 2. **Decide blocked.** A quota is **blocked** when its `percent` / `utilization`
    is **≥ 100** — checked across both the `limits[]` array and the top-level
    `five_hour` / `seven_day*` objects. Severity can escalate
    `normal → warning → critical → exhausted`, but **≥ 100 is the definitive
-   block**: at e.g. 91 % / *critical* autoresume does **not** arm. A real HTTP
-   429 on the usage GET is also treated as blocked (respecting `Retry-After`).
+   block**: at e.g. 91 % / *critical* autoresume does **not** arm.
 
-3. **Schedule.** The quota's `resets_at` (exact ISO 8601 UTC) + a small buffer
-   (default +45 s, for server clock lag) is the fire time. When several quotas
-   are blocked, the **latest** reset wins (the account is limited until the last
-   one clears). Spend / monthly caps have **no timed reset** → logged as "cannot
-   auto-resume" and skipped.
+3. **Arm on the observed hit (and persist it).** The first time a window is
+   *observed* at ≥ 100 %, autoresume **ARMS**: it records `{window, resets_at,
+   fire_at}` to `state.json`. The scheduled `fire_at` is `resets_at` (exact
+   ISO 8601 UTC) **+ a small buffer** (default +45 s, for server clock lag).
+   Because the arm is persisted, a **restart resumes it** — and a reset that
+   landed while the watcher was briefly down still fires on the next poll. When
+   several quotas block, the **latest** reset wins. Spend / monthly caps have no
+   timed reset → logged "cannot auto-resume" and skipped.
 
-4. **Dedup.** Each block collapses to a `(KIND, reset-minute)` key; a persisted
-   watermark (`state.json`) ensures **exactly one** injection per reset, even
-   across restarts.
+4. **Fire on clear (or at reset time).** While armed, autoresume keeps polling on
+   the same fast cadence and **fires the instant the armed window clears** — its
+   utilization drops back below the block line (a reset drops the window to ~0) —
+   **or** when `fire_at` is reached. It **never resumes into a still-blocked
+   account**: if the reset time has passed but the server still reports the window
+   ≥ 100 %, it waits and re-checks. Crucially it fires **only if a hit was
+   observed** (armed): a window at 0 % with no prior hit **never** fires.
 
-5. **Confirm, then inject.** At the fire time autoresume **re-polls** and only
-   injects once the quota's utilization has actually dropped below ~90 % (the
-   server can apply the reset a little late); if not, it re-checks every
-   `--confirm-interval` s until it does. Then it picks the target window
-   (**foreground-first**, see below), verifies it, types the message as literal
-   Unicode keystrokes, and presses Enter.
+5. **Dedup + inject.** Each reset collapses to a `(KIND, reset-minute)` key; a
+   persisted watermark (`state.json`) ensures **exactly one** injection per reset,
+   even across restarts. To inject it picks the target window (**foreground-first**,
+   see below), verifies it, types the message as literal Unicode keystrokes, and
+   presses Enter.
 
-6. **Log & loop.** Every poll decision and action (or abort, with reason) is
+6. **Manual override.** A manual resume time (GUI / `--resume-at`) fires at a set
+   wall-clock time regardless of API detection; see "Manual resume time" below.
+
+7. **Log & loop.** Every poll decision and action (or abort, with reason) is
    appended to `autoresume.log`; then it returns to watching for the next limit.
 
 ### Why the usage API (not the transcript)
@@ -100,14 +129,36 @@ transcript-text detector remains available as `--source transcript`.)
 The token is read fresh on every request (so a token the CLI refreshes is picked
 up), used **only** in the `Authorization` header, and never written anywhere.
 
-### Monitor-awareness ("use the monitor if it's running, else run on its own")
+### Fast direct polling (no monitor dependency)
 
-autoresume is always self-sufficient, but **courteous**: it detects the
-`UsageMonitorForClaude.exe` process (via `tasklist`, no third-party deps) and, if
-present, backs its own polling off to `--monitor-poll` (~15 min) so the two do
-not double-hit the API. When the monitor is not running it polls at
-`--usage-poll` (~150–180 s). Either way autoresume needs nothing from the
-monitor — it reads the same endpoint directly.
+autoresume polls the usage endpoint **directly and continuously** at
+`--poll-interval` (**default 30 s**), whether or not the **Usage Monitor for
+Claude** app is running. The Usage Monitor's presence is only **logged** (for
+information); it never changes the cadence. This is a deliberate change from
+v0.2.0's ~15-min courtesy backoff, which had a real hole: a limit could be **hit
+and reset inside one 15-min blind gap**, so the reset was missed and dead work
+never resumed. Polling itself, fast and continuously, is what closes that hole —
+combined with the arm-on-hit / fire-on-clear machine above, an observed hit is
+followed to its reset within one poll.
+
+### Manual resume time (GUI / `--resume-at`)
+
+Sometimes the reset time is already known from the on-screen error (“resets
+3:10pm”). You can schedule a resume for a specific time regardless of API
+detection:
+
+- **GUI:** type into the **“Resume at”** box (`HH:MM`, `+Nm`, or an ISO
+  timestamp), click **Set**; a status line shows the scheduled time. **Clear**
+  cancels it. A **“manual only”** checkbox suppresses auto-detection while set;
+  left unchecked, auto-detection stays on as a **backstop**.
+- **CLI:** `--resume-at HH:MM|+Nm|ISO` (with optional `--manual-only`). `HH:MM`
+  resolves to the next future occurrence; `+Nm` is minutes from now (`+Nh`/`+Ns`
+  too).
+
+The GUI and CLI share one **manual-request file** (default
+`%TEMP%\autoresume.manual.json`, `--manual-file`) — the same filesystem-IPC
+pattern as the kill-switch stop-file — so a manual time is honoured headless and
+across restarts, and fires exactly once (deduped like an auto reset).
 
 ### Source selection (`--source`)
 
@@ -177,23 +228,31 @@ reliable of the two into hard input surfaces, so it is the default.)
 
 Fail-safes, all implemented:
 
-- **Reset re-confirm (usage-API).** At the fire time autoresume re-polls the
-  usage endpoint and injects **only** once the quota's utilization has actually
-  dropped below ~90 %. If the server has not applied the reset yet it re-checks
-  every `--confirm-interval` s — it never resumes into a still-blocked account.
+- **Fire only on an observed hit.** autoresume arms **only** after seeing a window
+  at ≥ 100 %. A window at 0 % with no prior observed hit — a benign reset — is
+  **never** injected. (Tested: `test_state_machine.py::test_b_benign_reset_never_fires`.)
+- **Fire-on-clear / never into a blocked account.** While armed it re-polls on the
+  fast cadence and injects the moment the window **clears** (utilization back below
+  the block line) or the reset time arrives. If the reset time passes but the
+  server still reports the window ≥ 100 %, it **waits and re-checks** — it never
+  resumes into a still-blocked account.
+- **Persisted arm survives a restart.** The armed `{window, resets_at, fire_at}`
+  is written to `state.json`; a restart reloads it, so a reset that lands during a
+  brief downtime still fires on the next poll.
 - **Correct-window guard.** It types **only** if the *foreground* window is the
   target (right process **and** title). If activation fails or another app is in
   front, it **aborts and logs** — it never sprays a paragraph into the wrong
   window. (A stray Enter was cheap for the old script; a stray paragraph is not.)
 - **Exactly once per reset.** The `(KIND, reset-minute)` watermark in `state.json`
   guarantees a single injection per reset, across restarts, ignoring the retry
-  storm.
+  storm. A manual resume dedups the same way (`manual|<minute>`).
 - **No spam loop.** A global minimum interval between any two injections
   (default 60 s) as a backstop.
-- **Reset buffer.** Fires at reset **+ buffer** (default 45 s), never exactly on
-  the reset instant.
+- **Reset buffer.** An auto reset fires at reset **+ buffer** (default 45 s), never
+  exactly on the reset instant. (A manual `--resume-at` fires at the set time.)
 - **Kill switch.** If the stop-file (`%TEMP%\autoresume.stop`) exists, detection
-  and logging continue but injection is **held** until the file is removed.
+  and logging continue but injection (auto **and** manual) is **held** until the
+  file is removed.
 - **Spend / monthly caps are never injected** — a billing cap has no timed reset;
   it is logged as "cannot auto-resume" and skipped.
 - **Token safety.** All credential + network code is isolated in `usage_api.py`;
@@ -201,13 +260,14 @@ Fail-safes, all implemented:
 - **Full logging** of every poll decision (quota, percent, resolved reset) and
   every action (target window title + why, injected/held/aborted-and-why).
 
-State, log, and kill-switch locations:
+State, log, kill-switch, and manual-request locations:
 
 | item | default path |
 |------|--------------|
-| state (watermark) | `%LOCALAPPDATA%\claude-autoresume\state.json` |
+| state (watermark **+ persisted arm**) | `%LOCALAPPDATA%\claude-autoresume\state.json` |
 | log | `%LOCALAPPDATA%\claude-autoresume\autoresume.log` |
 | kill switch | `%TEMP%\autoresume.stop` |
+| manual resume request | `%TEMP%\autoresume.manual.json` |
 
 ---
 
@@ -224,9 +284,10 @@ State, log, and kill-switch locations:
   present in `keybindings.json` when using the default `--focus-method keybind`
   (see "Focusing the Claude Code chat input" above); otherwise use
   `--focus-method palette`.
-- Optional: the **Usage Monitor for Claude** app — if it is running, autoresume
-  backs off its own polling (it is not required). Optional: AutoHotkey v2 (for
-  `--injector ahk`), at `C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe`.
+- The **Usage Monitor for Claude** app is **not required** and no longer changes
+  autoresume's behaviour (its presence is only logged); autoresume polls the
+  endpoint directly. Optional: AutoHotkey v2 (for `--injector ahk`), at
+  `C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe`.
 
 ---
 
@@ -254,11 +315,14 @@ Useful options (`watch`):
 | flag | default | meaning |
 |------|---------|---------|
 | `--source {auto,usage-api,transcript}` | auto | detection source (see table above) |
-| `--buffer N` | 45 | seconds after reset before injecting |
-| `--usage-poll N` | 165 | usage-endpoint poll cadence (s) |
-| `--monitor-poll N` | 900 | backed-off cadence while the Usage Monitor app runs |
+| `--buffer N` | 45 | seconds after reset before injecting (auto) |
+| `--poll-interval N` (alias `--usage-poll`) | 30 | **direct** usage-endpoint poll cadence (s); also the fire-on-clear re-poll cadence while armed |
+| `--resume-at HH:MM\|+Nm\|ISO` | (none) | **manual** resume time — fire at this time regardless of API detection |
+| `--manual-only` | off | fire only the manual time; suppress auto-detection while set |
+| `--manual-file PATH` | `%TEMP%\autoresume.manual.json` | shared GUI/CLI manual-request file |
+| `--monitor-poll N` | 900 | **deprecated / ignored** (no monitor backoff any more) |
 | `--confirm-interval N` | 30 | re-poll cadence to confirm a reset before injecting |
-| `--confirm-below PCT` | 90 | utilization must drop below this to confirm a reset |
+| `--confirm-below PCT` | 90 | utilization must drop below this to count as cleared |
 | `--on-auth-expired {log,update}` | log | on HTTP 401: log, or run `claude update` once |
 | `--cred-path PATH` | auto | override the credentials file path |
 | `--injector {win32,ahk}` | win32 | keystroke mechanism |
@@ -270,8 +334,37 @@ Useful options (`watch`):
 | `--watch-dir DIR` | auto-detected project dir | transcript fallback: where to tail |
 | `--from-start` | off (tail from EOF) | transcript fallback: re-scan the whole file |
 
+Schedule a manual resume from the CLI (e.g. the error said “resets 3:10pm”):
+
+```bash
+python autoresume.py watch --resume-at 15:10          # fire at 3:10pm (auto stays on as backstop)
+python autoresume.py watch --resume-at +90m --manual-only   # 90 min from now, manual only
+```
+
 Run it once at logon (Task Scheduler → "At log on" → Program `pythonw.exe`,
 arguments the full path to `autoresume.py` plus `watch`), or from a terminal.
+
+### Status window (GUI)
+
+`python autoresume.py watch --gui` (or double-click `autoresume-gui.vbs` /
+`autoresume_gui.pyw` for a no-console launch) shows a small always-on-top status
+window over the **same** watch loop (it does not fork any detection/inject logic).
+It shows the current state (WATCHING / PENDING / FIRING / DONE / HELD), a live
+**countdown** to the fire time, and the last log line. Controls:
+
+- **Pause / Resume** — toggles the kill-switch stop-file (holds injection).
+- **Cancel reset** — drops the current armed reset (won’t fire).
+- **Inject now** — fires the pending resume immediately (bypasses the countdown).
+- **Resume at `[ HH:MM | +Nm | ISO ]` · Set · Clear** — the **manual resume-time**
+  control. **Set** schedules a resume at that wall-clock time (writing the shared
+  manual-request file the loop reads); a status line shows the scheduled time.
+  **Clear** cancels it. The **“manual only”** checkbox suppresses auto-detection
+  while a manual time is set; unchecked, auto-detection stays on as a backstop.
+
+All GUI controls talk to the watch loop the same way the loop already worked:
+Pause and the manual time via small files (`autoresume.stop` /
+`autoresume.manual.json`), Cancel/Inject-now via in-process request flags — so
+the actual injection always stays the loop’s single guarded path.
 
 ### Sub-commands for testing
 
@@ -288,21 +381,38 @@ python autoresume.py inject-now "hello from autoresume" --target-title "Notepad"
 ## Tests
 
 ```bash
-python -m pytest tests/ -q      # the pytest-collected suite (usage-API + GUI)
+python -m pytest tests/ -q      # usage-API + state-machine + GUI-derivation suite
 ```
 
-The pytest suite (`tests/test_usage_api.py`, `tests/test_gui.py`) covers the
-usage-API detection with **mocked** responses — no real network, no token:
+The pytest suite (`tests/test_usage_api.py`, `tests/test_state_machine.py`,
+`tests/test_gui.py`) covers detection with **mocked** responses — no real
+network, no token:
 
-- **89 % / 38 % → arm NONE** (and 91 % / *critical*) — reproduces today's
-  false-arm as a passing regression.
+- **89 % / 38 % → arm NONE** (and 91 % / *critical*) — reproduces the false-arm
+  as a passing regression.
 - **100 % / exhausted → arms**, with `fire_at == resets_at + buffer`.
 - **blocked → reset → injects exactly once** (driven through the real
   `run_watch` loop with a fake clock, dry-run).
 - **still blocked at fire time → waits / re-checks, never injects.**
 - **no credentials → `auto` falls back to the transcript source.**
 - **ISO 8601 `resets_at` tz parsing** (offset, microseconds, `Z`, non-UTC).
-- **monitor present → poll cadence backs off.**
+- **monitor running does NOT slow the poll cadence** (v0.3.0 removed the backoff).
+
+The v0.3.0 **state machine + manual mode** tests (`tests/test_state_machine.py`)
+drive a clock-aware mocked usage client through the real loop:
+
+- **(a) hit → reset ARMS then FIRES once** (fires on the observed clear).
+- **(b) benign reset (window < 100 % throughout, no hit) NEVER fires.**
+- **(c) a GUI-set manual time FIRES at that time** (and not before).
+- **(d) arm-state PERSISTS across a simulated restart** — a reset that landed
+  during downtime fires on the next poll.
+- **`parse_resume_at`** for `HH:MM` / `+Nm` / ISO, and the manual-request-file
+  round-trip.
+
+The GUI **manual-resume control** is exercised end-to-end by the opt-in smoke
+test (`python tests/test_gui.py --smoke`): it types into the “Resume at” box,
+clicks **Set**, and asserts the shared manual-request file is written (and
+**Clear** removes it) — the same file the watch loop consumes.
 
 The transcript-fallback / injection harnesses run standalone (not pytest-collected):
 
@@ -357,7 +467,7 @@ Improvements:
 | no window targeting | targets the **focused** VS Code window + correct-window guard |
 | no idea which limit / whether one was even hit | reads live `utilization`; knows **which** quota is blocked, resumes only recoverable ones |
 | could fire when no limit was hit | arms **only** when a quota is ≥ 100 %, deduped once per reset |
-| — | kill switch, logging, once-per-reset watermark, Usage-Monitor-aware polling |
+| — | kill switch, logging, once-per-reset watermark, fast direct polling, persisted arm-on-hit/fire-on-clear, manual resume time |
 
 You can leave the old `.ahk` disabled/removed once this is running at logon.
 

@@ -13,10 +13,31 @@ PRIMARY detection (self-sufficient): poll the authoritative usage endpoint
 (the same source the Usage Monitor for Claude uses; approach adapted from
 jens-duttke/usage-monitor-for-claude, MIT). A quota is blocked when its
 percent/utilization is >= 100; the resets_at timestamp gives the exact reset.
-If the Usage Monitor app is already running, autoresume BACKS OFF its polling so
-it does not double-hit the API -- self-sufficient always, courteous when the
-monitor is up. All credential + network code is isolated in usage_api.py; the
-OAuth token is never logged. See --source.
+autoresume polls the endpoint DIRECTLY on a FAST fixed cadence (~30s, see
+--poll-interval) -- it does NOT depend on the Usage Monitor app and no longer
+backs off when the monitor is running. Polling itself, fast and continuously, is
+what closes the "a limit was HIT and RESET inside one long blind poll gap, so the
+reset was missed and dead work never resumed" hole. All credential + network code
+is isolated in usage_api.py; the OAuth token is never logged. See --source.
+
+ARM-ON-HIT / FIRE-ON-RESET state machine: the watcher polls continuously. When a
+focused limit window is OBSERVED at utilization >= 100% (a real HIT) it ARMS and
+persists {armed, window, resets_at} to the state file. While ARMED it keeps
+polling and FIRES the resume the moment the armed window CLEARS (utilization drops
+back below the block line) OR the reset time is reached -- then DISARMS. It fires
+ONLY if a hit was actually observed: a window sitting at 0% with no prior observed
+hit NEVER fires. The armed state survives a watcher restart (reloaded from the
+state file), so a reset that lands while the watcher is briefly down is still
+picked up and resumed on the next poll.
+
+MANUAL mode: the owner can set an explicit resume time -- in the GUI (a "resume at
+HH:MM" field + Set/Clear, with a manual-only toggle) or via --resume-at
+(HH:MM | +Nm | ISO). The watcher then fires at that time regardless of API
+detection (useful when an error message already states the reset time, e.g.
+"resets 3:10pm"). Auto-detection stays on as a backstop unless manual-only is set.
+The GUI and the CLI share one manual-request file (same filesystem-IPC pattern as
+the kill-switch stop-file), so a manual time is honoured headless and across
+restarts.
 
 FALLBACK detection: the legacy transcript watcher (watch the session JSONL for a
 limit-hit line). Kept for machines with no readable credentials; it is no longer
@@ -36,7 +57,9 @@ No external Python packages are required beyond the standard library plus
 
 from __future__ import annotations
 
-__version__ = "0.2.0"   # 0.2.0: usage-API detection is now the primary source
+__version__ = "0.3.0"   # 0.3.0: fast direct polling (no monitor backoff),
+                        #        arm-on-hit/fire-on-clear state machine (persisted
+                        #        across restarts), GUI + CLI manual resume time
 
 import argparse
 import ctypes
@@ -120,20 +143,36 @@ STALE_RESET_GRACE = 6 * 3600 # if a reset already passed by more than this, trea
                              # the entry as historical and do NOT inject.
 
 # --- usage-API detection cadence (seconds) --------------------------------- #
-USAGE_POLL_INTERVAL = 165    # normal usage-endpoint poll cadence (~150-180s)
-MONITOR_POLL_INTERVAL = 900  # back off to ~15min when UsageMonitorForClaude.exe is
-                             # running (it is already polling; don't double-hit)
-CONFIRM_INTERVAL = 30        # at fire time, re-poll every this-many-s until the
-                             # server confirms the quota actually reset (<~90%)
-CONFIRM_BELOW = 90.0         # utilization must drop below this to confirm reset
+# FAST DIRECT POLLING. We poll the usage endpoint OURSELVES on this cadence,
+# always, regardless of whether the Usage Monitor app is running. The old
+# monitor-aware 900s courtesy backoff is GONE: a ~15-min blind gap could let a
+# limit be hit AND reset inside one gap, so the reset was missed and dead work
+# never resumed. A short fixed cadence closes that hole; the arm-on-hit /
+# fire-on-clear machine (below) then catches the reset within one poll.
+USAGE_POLL_INTERVAL = 30     # DIRECT usage-endpoint poll cadence (seconds).
+                             # Override with --poll-interval.
+MONITOR_POLL_INTERVAL = 900  # DEPRECATED / ignored -- kept only so an existing
+                             # --monitor-poll argument still parses. Cadence no
+                             # longer backs off for the monitor.
+CONFIRM_INTERVAL = 30        # while ARMED past the reset time but the server has
+                             # not applied the reset yet, re-poll every this-many-s
+CONFIRM_BELOW = 90.0         # a quota's utilization must drop below this to count
+                             # as CLEARED (a real reset drops the window to ~0, so
+                             # 90 is an unambiguous "cleared" line under the 100
+                             # block threshold)
 MONITOR_CACHE_TTL = 60       # cache the tasklist monitor-presence check this long
+                             # (only used for an informational log now)
 USAGE_MONITOR_PROC = "UsageMonitorForClaude.exe"  # the Usage Monitor app image
 
 _LOCALAPPDATA = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
 STATE_DIR = os.path.join(_LOCALAPPDATA, "claude-autoresume")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 LOG_FILE = os.path.join(STATE_DIR, "autoresume.log")
-STOP_FILE = os.path.join(os.environ.get("TEMP", STATE_DIR), "autoresume.stop")
+_TEMP_DIR = os.environ.get("TEMP", STATE_DIR)
+STOP_FILE = os.path.join(_TEMP_DIR, "autoresume.stop")
+# Manual-resume-time request file (GUI + CLI shared IPC, same filesystem pattern
+# as the kill-switch stop-file): JSON {"resume_at": <epoch>, "manual_only": bool}.
+MANUAL_FILE = os.path.join(_TEMP_DIR, "autoresume.manual.json")
 
 MONTHS = {
     "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
@@ -785,6 +824,168 @@ def kill_switch_active() -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Manual resume time: parsing + shared request file (GUI + CLI IPC)            #
+#                                                                              #
+# The manual-request file is the counterpart to the kill-switch stop-file: a   #
+# tiny JSON the GUI (or --resume-at at startup) writes and the watch loop reads #
+# every tick. Filesystem IPC (not an in-process flag) so a manual time is       #
+# honoured headless, survives a restart, and works if the GUI and a headless    #
+# watcher are separate processes -- exactly how pause/stop already works.       #
+# --------------------------------------------------------------------------- #
+
+_RESUME_REL_RE = re.compile(r"^\+\s*(\d+)\s*([smh]?)$", re.IGNORECASE)
+_RESUME_HHMM_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
+def parse_resume_at(spec: str, now: datetime | None = None) -> float:
+    """Resolve a manual resume-time spec to an epoch (seconds).
+
+    Accepts:
+      - '+Nm' / '+Nh' / '+Ns' / '+N'  -> now + N minutes (default unit minutes),
+        hours ('h') or seconds ('s').
+      - 'HH:MM'                        -> the NEXT future occurrence of that local
+        wall-clock time (today, or tomorrow if already passed).
+      - an ISO-8601 timestamp          -> that instant (naive is taken as local).
+
+    Raises ValueError on an unparseable spec. `now` is injectable for tests."""
+    if spec is None:
+        raise ValueError("no resume-at spec")
+    s = str(spec).strip()
+    if not s:
+        raise ValueError("empty resume-at spec")
+    base = datetime.now().astimezone() if now is None else now
+    if base.tzinfo is None:
+        base = base.astimezone()
+
+    m = _RESUME_REL_RE.match(s)
+    if m:
+        n = int(m.group(1))
+        unit = (m.group(2) or "m").lower()
+        mult = {"s": 1, "m": 60, "h": 3600}[unit]
+        return (base + timedelta(seconds=n * mult)).timestamp()
+
+    m = _RESUME_HHMM_RE.match(s)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(f"HH:MM out of range: {s!r}")
+        dt = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if dt <= base:
+            dt = dt + timedelta(days=1)
+        return dt.timestamp()
+
+    # ISO-8601 fallback.
+    try:
+        iso = s[:-1] + "+00:00" if s.endswith("Z") else s
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        raise ValueError(f"unrecognised resume-at {s!r} "
+                         f"(use HH:MM, +Nm, or an ISO timestamp)") from None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=base.tzinfo)
+    return dt.timestamp()
+
+
+def read_manual_request(path=MANUAL_FILE):
+    """Return {'resume_at': float, 'manual_only': bool} from the manual-request
+    file, or None if it is absent / malformed / missing a resume_at."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    ra = data.get("resume_at")
+    try:
+        ra = float(ra)
+    except (TypeError, ValueError):
+        return None
+    return {"resume_at": ra, "manual_only": bool(data.get("manual_only", False))}
+
+
+def write_manual_request(path, resume_at: float, manual_only: bool = False):
+    """Atomically write the manual-request file (GUI Set / CLI --resume-at)."""
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"resume_at": float(resume_at),
+                   "manual_only": bool(manual_only)}, fh)
+    os.replace(tmp, path)
+
+
+def clear_manual_request(path=MANUAL_FILE):
+    """Remove the manual-request file (GUI Clear / after a manual fire)."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# Arm persistence: survive a watcher restart mid-arm                           #
+#                                                                              #
+# When a hit is OBSERVED the loop persists the armed pending into state.json so #
+# a restart resumes it -- and a reset that lands while the watcher was briefly  #
+# down still fires on the next poll. Only the label is kept in `meta` (JSON     #
+# safe; confirm_reset needs nothing else), never a datetime.                    #
+# --------------------------------------------------------------------------- #
+
+# How stale a persisted arm may be (seconds) before it is treated as historical
+# on restore and dropped without firing (a clearly dead session, not a missed
+# reset). Generous: a reset missed during a short downtime still fires.
+ARM_RESTORE_MAX_STALE = 3 * 86400
+
+
+def save_arm(state: dict, pending: dict, state_file=STATE_FILE):
+    """Persist the armed pending (JSON-safe) into state and write it."""
+    state["arm"] = {
+        "kind": pending.get("kind"),
+        "reset_str": pending.get("reset_str"),
+        "reset_epoch": pending.get("reset_epoch"),
+        "key": pending.get("key"),
+        "fire_at": pending.get("fire_at"),
+        "meta": {"label": (pending.get("meta") or {}).get("label")
+                 or pending.get("kind")},
+        "observed_at": pending.get("observed_at", time.time()),
+    }
+    save_state(state, state_file)
+
+
+def clear_arm(state: dict, state_file=STATE_FILE):
+    if state.get("arm") is not None:
+        state["arm"] = None
+        save_state(state, state_file)
+
+
+def restore_arm(state: dict, now=None):
+    """Reconstruct an in-memory pending from a persisted arm, or None.
+
+    Drops the arm if it is already handled (fired) or absurdly stale."""
+    arm = state.get("arm")
+    if not isinstance(arm, dict) or arm.get("fire_at") is None:
+        return None
+    key = arm.get("key")
+    if key and is_handled(state, key):
+        return None
+    now = time.time() if now is None else now
+    re_epoch = arm.get("reset_epoch")
+    if re_epoch is not None and (now - float(re_epoch)) > ARM_RESTORE_MAX_STALE:
+        return None
+    return {
+        "kind": arm.get("kind"),
+        "reset_str": arm.get("reset_str"),
+        "reset_epoch": re_epoch,
+        "key": key,
+        "fire_at": float(arm["fire_at"]),
+        "meta": arm.get("meta") or {"label": arm.get("kind")},
+        "observed_at": arm.get("observed_at"),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Message                                                                      #
 # --------------------------------------------------------------------------- #
 
@@ -796,9 +997,22 @@ RESUME_TEMPLATE = (
     "the current todo list, and keep going. Do not wait for user input."
 )
 
+# Manual mode: the owner scheduled this resume time explicitly (GUI / --resume-at)
+# rather than it being detected from the usage API.
+MANUAL_RESUME_TEMPLATE = (
+    "[AUTOMATED RESUME] A manually scheduled resume time ({reset_str}) has been "
+    "reached. This is an automated message; the user is away and will NOT see or "
+    "respond to your output. Continue the autonomous work from where you left "
+    "off: consult _research/AUTONOMOUS_WORKLOG.md and the current todo list, and "
+    "keep going. Do not wait for user input."
+)
+
 
 def build_message(kind: str, reset_str: str) -> str:
-    # kind reaching here is only session|weekly (monthly-spend never injects).
+    # kind reaching here is session|weekly (auto) or "manual" (scheduled time).
+    # monthly-spend never injects.
+    if kind == "manual":
+        return MANUAL_RESUME_TEMPLATE.format(reset_str=reset_str)
     return RESUME_TEMPLATE.format(kind=kind, reset_str=reset_str)
 
 
@@ -928,11 +1142,12 @@ class TranscriptSource:
 class UsageApiSource:
     """PRIMARY source: poll GET /api/oauth/usage and arm on percent >= 100.
 
-    Rate-limits its OWN network calls independently of the watch loop tick:
-    ~USAGE_POLL_INTERVAL normally, backing off to ~MONITOR_POLL_INTERVAL while
-    the Usage Monitor app is running (it already polls -- don't double-hit). At
-    fire time it RE-POLLS to confirm the server actually applied the reset before
-    injecting (utilization dropped below the confirm threshold)."""
+    Polls the endpoint on a FAST FIXED cadence (self.normal, default ~30s), ALWAYS
+    -- it no longer backs off when the Usage Monitor app is running (that 15-min
+    backoff let a hit+reset slip through one blind gap). While the watch loop is
+    ARMED it also calls confirm_reset() every tick to detect the reset the instant
+    the window CLEARS. The Usage Monitor's presence is now only logged for
+    information; it never changes our cadence."""
 
     def __init__(self, args, log, client=None, monitor_check=None):
         self.args = args
@@ -941,8 +1156,11 @@ class UsageApiSource:
             cred_path=getattr(args, "cred_path", None)
         )
         self._monitor_check = monitor_check or usage_monitor_running
-        self.normal = getattr(args, "usage_poll", USAGE_POLL_INTERVAL)
-        self.backoff = getattr(args, "monitor_poll", MONITOR_POLL_INTERVAL)
+        self.normal = (getattr(args, "poll_interval", None)
+                       or getattr(args, "usage_poll", None)
+                       or USAGE_POLL_INTERVAL)
+        # Retained for API/test compatibility; no longer used to back off cadence.
+        self.backoff = self.normal
         self.confirm_below = getattr(args, "confirm_below", CONFIRM_BELOW)
         self.monitor_proc = getattr(args, "usage_monitor_proc", USAGE_MONITOR_PROC)
         self.on_auth_expired = getattr(args, "on_auth_expired", "log")
@@ -955,18 +1173,18 @@ class UsageApiSource:
     def label(self):
         return "usage-api"
 
-    def _monitor_running(self, now):
+    def _log_monitor_state(self, now):
+        """Informational only: note when the Usage Monitor app comes/goes. Does
+        NOT change our poll cadence (we always poll directly at self.normal)."""
         ts, val = self._monitor_cache
         if now - ts >= MONITOR_CACHE_TTL:
             val = bool(self._monitor_check(self.monitor_proc))
             self._monitor_cache = (now, val)
             if val != self._monitor_logged:
-                if val:
-                    self.log(f"MONITOR {self.monitor_proc} running -> backing off "
-                             f"usage polls to {self.backoff}s (courtesy)")
-                else:
-                    self.log(f"MONITOR {self.monitor_proc} not running -> normal "
-                             f"usage poll cadence {self.normal}s")
+                state = "running" if val else "not running"
+                self.log(f"MONITOR {self.monitor_proc} {state} (informational; "
+                         f"autoresume polls directly every {self.normal}s "
+                         f"regardless)")
                 self._monitor_logged = val
         return val
 
@@ -1037,9 +1255,10 @@ class UsageApiSource:
         usage = self._fetch()
         if usage is None:
             return []                       # error path already set the backoff
-        # Success: set the NEXT cadence (courtesy backoff if the monitor is up).
-        self._interval = float(self.backoff if self._monitor_running(now)
-                               else self.normal)
+        # Success: next fetch is due after our fixed fast cadence. The Usage
+        # Monitor's presence is only logged, never used to slow us down.
+        self._log_monitor_state(now)
+        self._interval = float(self.normal)
         blocked = usage_api.find_blocked_quotas(usage)
         return [self._to_hit(q) for q in blocked]
 
@@ -1109,13 +1328,21 @@ def select_source(args, log, creds_available=None):
 
 
 def run_watch(args, shared=None, source=None):
-    """Detect a usage-limit block and auto-resume on reset.
+    """Detect a usage-limit block and auto-resume on reset (ARM-ON-HIT machine).
 
     Detection is delegated to a SOURCE (usage-api primary / transcript fallback,
-    chosen per --source; injectable for tests). The loop is source-agnostic: it
-    schedules the pending injection at reset+buffer, RE-CONFIRMS via the source
-    that the reset was actually applied before firing, dedups once-per-reset, and
-    guards the injection.
+    chosen per --source; injectable for tests). The loop:
+
+      * polls the source CONTINUOUSLY on a fast cadence -- for hits while idle,
+        and (via confirm_reset) for the armed window CLEARING while armed;
+      * ARMS the moment a hit is OBSERVED (percent >= 100) and PERSISTS the arm
+        to the state file, so a restart resumes it and a reset that lands while
+        the watcher is briefly down still fires;
+      * FIRES the resume when the armed window CLEARS (utilization dropped back
+        below the block line) OR the reset time is reached -- fires ONLY if a hit
+        was observed, so a window at 0% with no prior hit never fires;
+      * also honours a MANUAL resume time (GUI / --resume-at) that fires at a set
+        wall-clock time regardless of API detection.
 
     `shared` is an optional WatchStatus the GUI reads: when provided, the loop
     PUBLISHES its state transitions (WATCHING/PENDING/FIRING/DONE + the fire_at
@@ -1131,8 +1358,14 @@ def run_watch(args, shared=None, source=None):
             shared.set_last_log(m)
 
     src = source if source is not None else select_source(args, log)
+    manual_file = getattr(args, "manual_file", MANUAL_FILE)
+    # Fast fixed poll cadence, used both for idle hit-polling and, while ARMED,
+    # for the fire-on-clear confirm re-poll (loop tick stays short for GUI /
+    # kill-switch responsiveness; the NETWORK cadence is this).
+    armed_poll = max(1, int(getattr(args, "usage_poll", None) or USAGE_POLL_INTERVAL))
     log(f"START autoresume v{__version__} source={src.label()} "
-        f"buffer={args.buffer}s injector={args.injector} dry_run={args.dry_run}")
+        f"buffer={args.buffer}s poll={armed_poll}s injector={args.injector} "
+        f"dry_run={args.dry_run}")
     stop_path = args.stop_file
     if stop_path and os.path.exists(stop_path):
         log(f"NOTE kill switch present at {stop_path}; injection disabled until removed")
@@ -1140,18 +1373,48 @@ def run_watch(args, shared=None, source=None):
 
     state = load_state(args.state_file)
     last_inject_time = 0.0
-    confirm_interval = getattr(args, "confirm_interval", CONFIRM_INTERVAL)
 
-    # Pending injection: dict(kind, reset_str, reset_epoch, key, fire_at, meta)
-    pending = None
-    kill_logged = False       # log kill-switch HOLD only on state change (no spam)
+    # Restore a persisted arm (survives a restart; a reset missed during downtime
+    # fires on the next poll). Pending: dict(kind, reset_str, reset_epoch, key,
+    # fire_at, meta, observed_at).
+    pending = restore_arm(state)
+    if pending is not None:
+        log(f"RESUME persisted arm {pending['key']} "
+            f"(fire_at {datetime.fromtimestamp(pending['fire_at']).isoformat(timespec='seconds')})")
+        publish(state="PENDING", kind=pending.get("kind"),
+                reset_str=pending.get("reset_str"),
+                reset_epoch=pending.get("reset_epoch"), fire_at=pending["fire_at"])
+    else:
+        clear_arm(state, args.state_file)   # drop a stale/handled persisted arm
+
+    # CLI --resume-at seeds the shared manual-request file once (if in the future).
+    ra_spec = getattr(args, "resume_at", None)
+    if ra_spec:
+        try:
+            ra_epoch = parse_resume_at(ra_spec)
+            if ra_epoch > time.time():
+                write_manual_request(manual_file, ra_epoch,
+                                     bool(getattr(args, "manual_only", False)))
+                log(f"MANUAL --resume-at {ra_spec!r} -> fire at "
+                    f"{_fmt_local(ra_epoch)} "
+                    f"(manual_only={bool(getattr(args, 'manual_only', False))})")
+            else:
+                log(f"MANUAL --resume-at {ra_spec!r} resolves to a PAST time "
+                    f"({_fmt_local(ra_epoch)}); ignoring")
+        except ValueError as e:
+            log(f"MANUAL --resume-at {ra_spec!r} unparseable: {e}")
+
+    kill_logged = False          # log kill-switch HOLD only on change (no spam)
+    manual_hold_logged = False   # ditto for the manual HOLD
     confirm_wait_logged = False  # log confirm-wait only on change (no spam)
+    last_armed_confirm = 0.0     # last time we network-confirmed while armed
 
     def do_inject(kind, reset_str):
         nonlocal last_inject_time
         message = build_message(kind, reset_str)
         if args.dry_run:
             log(f"DRY-RUN would inject ({kind}): {message}")
+            last_inject_time = time.time()
             return True
         if args.injector == "ahk":
             ok, detail = inject_via_ahk(message, args.ahk_exe, args.ahk_script, log)
@@ -1170,21 +1433,63 @@ def run_watch(args, shared=None, source=None):
         publish(stopped=stopped)
 
         # GUI request: cancel the current pending reset (mark it handled so it
-        # never fires and drop it). No-op when headless / nothing pending.
+        # never fires and drop it + its persisted arm). No-op when idle.
         if shared is not None and shared.take_cancel():
             if pending is not None:
                 log(f"CANCEL pending {pending['key']} by GUI request")
                 mark_handled(state, pending["key"])
-                save_state(state, args.state_file)
+                clear_arm(state, args.state_file)      # also saves state
                 pending = None
                 confirm_wait_logged = False
                 publish(state="WATCHING", fire_at=None, kind=None, reset_str=None,
                         reset_epoch=None, last_action="cancelled pending reset")
 
-        # Discover blocks only while nothing is pending: once we know the reset
-        # time we simply wait for it (the usage-API source would otherwise poll
-        # the endpoint for the whole -- possibly multi-day -- window).
-        if pending is None:
+        # ---- Manual resume request (GUI / CLI shared file) ------------------- #
+        manual = read_manual_request(manual_file)
+        manual_only = bool(getattr(args, "manual_only", False)) or bool(
+            manual and manual.get("manual_only"))
+        publish(manual_resume_at=(manual["resume_at"] if manual else None),
+                manual_only=manual_only)
+
+        now = time.time()
+
+        # ---- MANUAL FIRE: fire at the owner-set time regardless of detection -- #
+        if manual is not None:
+            m_fire = float(manual["resume_at"])
+            if now >= m_fire:
+                mkey = f"manual|{int(round(m_fire / 60.0)) * 60}"
+                if is_handled(state, mkey):
+                    clear_manual_request(manual_file)   # already fired; drop it
+                elif stopped:
+                    if not manual_hold_logged:
+                        log(f"HOLD manual resume {mkey}: kill switch present at "
+                            f"{args.stop_file}; will inject once removed")
+                        manual_hold_logged = True
+                elif (now - last_inject_time) >= args.min_interval:
+                    manual_hold_logged = False
+                    log(f"FIRE manual resume {mkey} (scheduled {_fmt_local(m_fire)})")
+                    publish(state="FIRING")
+                    ok = do_inject("manual", _fmt_local(m_fire))
+                    if ok:
+                        mark_handled(state, mkey)
+                        clear_manual_request(manual_file)
+                        # one resume suffices: drop any auto arm too.
+                        pending = None
+                        clear_arm(state, args.state_file)   # also saves state
+                        confirm_wait_logged = False
+                        log(f"DONE injected+recorded {mkey}")
+                        publish(state="DONE", fire_at=None,
+                                last_action=f"injected manual ({mkey})")
+                    else:
+                        log(f"RETRY-LATER manual inject failed for {mkey}; "
+                            f"will retry next poll")
+                        publish(state="PENDING",
+                                last_action=f"manual inject failed for {mkey}; retrying")
+
+        # ---- AUTO ARM: discover a block only while idle (and not manual-only) - #
+        # Once armed we stop hunting for new hits and instead watch the armed
+        # window for its CLEAR (below); the account stays limited until it resets.
+        if not manual_only and pending is None:
             for hit in src.poll():
                 kind = hit.get("kind")
                 reset_str = hit.get("reset_str")
@@ -1227,12 +1532,14 @@ def run_watch(args, shared=None, source=None):
                     pending = {
                         "kind": kind, "reset_str": reset_str,
                         "reset_epoch": reset_epoch, "key": key, "fire_at": fire_at,
-                        "meta": hit.get("meta"),
+                        "meta": hit.get("meta"), "observed_at": now,
                     }
                     confirm_wait_logged = False
-                    log(f"PENDING inject {key} at "
+                    last_armed_confirm = 0.0
+                    save_arm(state, pending, args.state_file)   # PERSIST the arm
+                    log(f"ARM {key} at "
                         f"{datetime.fromtimestamp(fire_at).isoformat(timespec='seconds')} "
-                        f"(reset+{args.buffer}s)")
+                        f"(reset+{args.buffer}s); armed on observed hit, persisted")
                     publish(state="PENDING", kind=kind, reset_str=reset_str,
                             reset_epoch=reset_epoch, fire_at=fire_at)
 
@@ -1241,64 +1548,71 @@ def run_watch(args, shared=None, source=None):
         # it explicitly). Still routed through the SAME guarded do_inject below.
         force_now = bool(shared is not None and shared.take_inject_now())
 
-        # Fire pending injection when due.
-        if pending is not None:
+        # ---- AUTO FIRE: fire when the armed window CLEARS or its time arrives - #
+        if not manual_only and pending is not None:
             now = time.time()
-            if force_now or now >= pending["fire_at"]:
+            fire = False
+            reason = ""
+            # FIRE-ON-CLEAR: while armed we re-poll on the fast cadence and fire
+            # the instant the source reports the window cleared (utilization back
+            # below the block line). This catches an early / exact reset and a
+            # reset that landed while we were restarting -- not just reset+buffer.
+            confirm_due = (force_now or last_armed_confirm == 0.0
+                           or (now - last_armed_confirm) >= armed_poll)
+            if force_now:
+                fire, reason = True, "inject-now"
+            elif confirm_due:
+                last_armed_confirm = now
+                confirmed, detail = src.confirm_reset(pending, log)
+                if confirmed:
+                    fire, reason = True, f"window cleared ({detail})"
+                    confirm_wait_logged = False
+                elif now >= pending["fire_at"]:
+                    # Reset time reached but the server has not applied its own
+                    # reset yet -> never resume into a still-blocked account; wait.
+                    if not confirm_wait_logged:
+                        log(f"WAIT {pending['key']}: reset not applied yet "
+                            f"({detail}); re-checking every {armed_poll}s")
+                        confirm_wait_logged = True
+                    publish(state="PENDING",
+                            last_action=f"reset not applied yet ({detail})")
+
+            if fire:
+                key = pending["key"]
                 if stopped:
                     # Kill switch present: HOLD the injection until it is lifted.
                     if not kill_logged:
-                        log(f"HOLD injection {pending['key']}: kill switch present "
-                            f"at {args.stop_file}; will inject once removed")
+                        log(f"HOLD injection {key}: kill switch present at "
+                            f"{args.stop_file}; will inject once removed")
                         kill_logged = True
-                    time.sleep(args.poll)
-                    continue
-                kill_logged = False
-                if not force_now and now - last_inject_time < args.min_interval:
-                    # backstop; wait out the remaining interval
-                    time.sleep(min(args.poll, args.min_interval - (now - last_inject_time)))
-                    continue
-                key = pending["key"]
-                if is_handled(state, key):
+                    # do not fire this tick; re-evaluate after the loop sleep
+                elif not force_now and (now - last_inject_time) < args.min_interval:
+                    pass    # global min-interval backstop; retry next tick
+                elif is_handled(state, key):
                     log(f"SKIP {key} became handled before fire")
+                    clear_arm(state, args.state_file)
                     pending = None
                     confirm_wait_logged = False
                     publish(state="DONE", fire_at=None)
-                    continue
-                # Reset-confirm: the reset time has arrived, but the server may
-                # not have APPLIED the reset yet. Ask the source to confirm
-                # (usage-API re-polls; transcript returns True). Skip on force_now.
-                if not force_now:
-                    confirmed, detail = src.confirm_reset(pending, log)
-                    if not confirmed:
-                        if not confirm_wait_logged:
-                            log(f"WAIT {key}: reset not applied yet ({detail}); "
-                                f"re-checking every {confirm_interval}s")
-                            confirm_wait_logged = True
-                        publish(state="PENDING",
-                                last_action=f"reset not applied yet ({detail})")
-                        # Re-poll cadence until the server applies the reset.
-                        time.sleep(max(1, confirm_interval))
-                        continue
-                    confirm_wait_logged = False
-                log(f"FIRE inject {key} (kind={pending['kind']})"
-                    + (" [inject-now]" if force_now else ""))
-                publish(state="FIRING")
-                ok = do_inject(pending["kind"], pending["reset_str"])
-                if ok:
-                    mark_handled(state, key)
-                    save_state(state, args.state_file)
-                    log(f"DONE injected+recorded {key}")
-                    publish(state="DONE", fire_at=None,
-                            last_action=f"injected {pending['kind']} ({key})")
                 else:
-                    log(f"RETRY-LATER inject failed for {key}; will retry next poll")
-                    publish(state="PENDING", last_action=f"inject failed for {key}; retrying")
-                    # leave pending so we retry; but avoid tight loop
-                    time.sleep(args.poll)
-                    continue
-                pending = None
-                confirm_wait_logged = False
+                    kill_logged = False
+                    log(f"FIRE inject {key} (kind={pending['kind']}; {reason})"
+                        + (" [inject-now]" if force_now else ""))
+                    publish(state="FIRING")
+                    ok = do_inject(pending["kind"], pending["reset_str"])
+                    if ok:
+                        mark_handled(state, key)
+                        clear_arm(state, args.state_file)   # also saves state
+                        log(f"DONE injected+recorded {key}")
+                        publish(state="DONE", fire_at=None,
+                                last_action=f"injected {pending['kind']} ({key})")
+                        pending = None
+                        confirm_wait_logged = False
+                    else:
+                        log(f"RETRY-LATER inject failed for {key}; "
+                            f"will retry next poll")
+                        publish(state="PENDING",
+                                last_action=f"inject failed for {key}; retrying")
 
         time.sleep(src.loop_tick(pending, time.time(), args))
 
@@ -1334,6 +1648,8 @@ class WatchStatus:
             "fire_at": None,       # reset_epoch + buffer -> the countdown TARGET
             "last_log": "",        # last log line the loop emitted
             "last_action": "",     # last consequential action
+            "manual_resume_at": None,  # owner-set manual resume time (epoch) or None
+            "manual_only": False,      # manual-only (auto-detection suppressed)
         }
         self._cancel = False
         self._inject_now = False
@@ -1408,6 +1724,8 @@ def derive_view(snap: dict, now: float) -> dict:
     kind = snap.get("kind")
     reset_str = snap.get("reset_str")
     reset_epoch = snap.get("reset_epoch")
+    manual_resume_at = snap.get("manual_resume_at")
+    manual_only = bool(snap.get("manual_only"))
 
     headline = "HELD" if stopped else state
 
@@ -1434,6 +1752,11 @@ def derive_view(snap: dict, now: float) -> dict:
     else:  # WATCHING
         status = "Watching — no limit hit yet"
 
+    manual_line = ""
+    if manual_resume_at:
+        manual_line = (f"Manual resume {_fmt_local(manual_resume_at)}"
+                       + ("  (manual-only)" if manual_only else "  (backstop: auto on)"))
+
     return {
         "headline": headline,
         "countdown": countdown,
@@ -1442,6 +1765,9 @@ def derive_view(snap: dict, now: float) -> dict:
         "status_line": status,
         "kind": kind,
         "reset_str": reset_str,
+        "manual_resume_at": manual_resume_at,
+        "manual_only": manual_only,
+        "manual_line": manual_line,
     }
 
 
@@ -1465,10 +1791,12 @@ class StatusWindow:
     Buttons route through the shared request flags / the stop-file -- the actual
     injection stays the watch loop's single guarded do_inject path."""
 
-    def __init__(self, root, shared: WatchStatus, stop_file: str, tick_ms: int = 1000):
+    def __init__(self, root, shared: WatchStatus, stop_file: str,
+                 manual_file: str = None, tick_ms: int = 1000):
         self.root = root
         self.shared = shared
         self.stop_file = stop_file
+        self.manual_file = manual_file or MANUAL_FILE
         self.tick_ms = tick_ms
         self._scheduled = None
 
@@ -1491,6 +1819,10 @@ class StatusWindow:
         self.var_detail = tk.StringVar(value="")
         self.var_lastlog = tk.StringVar(value="")
         self.var_pause = tk.StringVar(value="Pause")
+        # Manual resume-time control.
+        self.var_manual_entry = tk.StringVar(value="")
+        self.var_manual_status = tk.StringVar(value="Manual resume: not set")
+        self.var_manual_only = tk.IntVar(value=0)
 
         pad = {"padx": 12}
         self.lbl_state = tk.Label(root, textvariable=self.var_state, font=state_f,
@@ -1516,6 +1848,33 @@ class StatusWindow:
         tk.Button(btns, text="Inject now", width=10,
                   command=self.inject_now).pack(side="left", padx=(6, 0))
 
+        # -- Manual resume-time control -------------------------------------- #
+        # A divider + a labelled row: "Resume at [ HH:MM|+Nm|ISO ] [Set][Clear]".
+        # Set writes the shared manual-request file; the watch loop fires at that
+        # time regardless of API detection. Clear removes it.
+        tk.Frame(root, bg="#333333", height=1).pack(fill="x", pady=(2, 4), **pad)
+        man = tk.Frame(root, bg=_BG)
+        man.pack(fill="x", pady=(0, 2), **pad)
+        tk.Label(man, text="Resume at", font=small, bg=_BG, fg=_FG).pack(side="left")
+        self.ent_manual = tk.Entry(man, textvariable=self.var_manual_entry, width=14,
+                                   font=small, bg="#2a2a2a", fg=_FG,
+                                   insertbackground=_FG, relief="flat")
+        self.ent_manual.pack(side="left", padx=(6, 6))
+        self.ent_manual.bind("<Return>", lambda _e: self.set_manual())
+        tk.Button(man, text="Set", width=5, command=self.set_manual).pack(side="left")
+        tk.Button(man, text="Clear", width=6,
+                  command=self.clear_manual).pack(side="left", padx=(4, 0))
+        opt = tk.Frame(root, bg=_BG)
+        opt.pack(fill="x", **pad)
+        tk.Checkbutton(opt, text="manual only (suppress auto-detect)",
+                       variable=self.var_manual_only, font=small, bg=_BG, fg=_SUBFG,
+                       selectcolor=_BG, activebackground=_BG, activeforeground=_FG,
+                       command=self._reapply_manual_only).pack(side="left")
+        self.lbl_manual = tk.Label(root, textvariable=self.var_manual_status,
+                                   font=small, bg=_BG, fg=_SUBFG, anchor="w",
+                                   justify="left", wraplength=380)
+        self.lbl_manual.pack(fill="x", pady=(2, 4), **pad)
+
         tk.Label(root, textvariable=self.var_lastlog, font=mono, bg=_BG, fg="#6a6a6a",
                  anchor="w", justify="left", wraplength=380).pack(fill="x",
                                                                   pady=(0, 8), **pad)
@@ -1524,8 +1883,13 @@ class StatusWindow:
     def refresh(self):
         snap = self.shared.snapshot()
         # The stop-file is the source of truth for the kill switch; check it live
-        # so Pause/Resume reflects INSTANTLY (not at the next 5s watch poll).
+        # so Pause/Resume reflects INSTANTLY (not at the next watch poll).
         snap["stopped"] = bool(self.stop_file and os.path.exists(self.stop_file))
+        # The manual-request FILE is the source of truth for the scheduled manual
+        # time (so it reflects a headless set / a set from another process too).
+        mreq = read_manual_request(self.manual_file)
+        snap["manual_resume_at"] = mreq["resume_at"] if mreq else None
+        snap["manual_only"] = bool(mreq and mreq.get("manual_only"))
         view = derive_view(snap, time.time())
 
         self.var_state.set(view["headline"])
@@ -1536,6 +1900,8 @@ class StatusWindow:
         last = snap.get("last_log") or ""
         self.var_lastlog.set(last if len(last) <= 90 else last[:87] + "…")
         self.var_pause.set("Resume" if snap["stopped"] else "Pause")
+        self.var_manual_status.set(view["manual_line"] or "Manual resume: not set")
+        self.lbl_manual.configure(fg="#f0c040" if view["manual_resume_at"] else _SUBFG)
 
         if self.tick_ms:
             self._scheduled = self.root.after(self.tick_ms, self.refresh)
@@ -1566,6 +1932,54 @@ class StatusWindow:
     def inject_now(self):
         self.shared.request_inject_now()
 
+    # -- manual resume-time handlers --------------------------------------- #
+    def set_manual(self):
+        """Parse the entry (HH:MM | +Nm | ISO) and write the manual-request file.
+
+        The watch loop reads the file each tick and fires the resume at that time
+        regardless of API detection. Invalid input shows a red error line."""
+        spec = (self.var_manual_entry.get() or "").strip()
+        if not spec:
+            self.var_manual_status.set("Manual resume: enter HH:MM, +Nm, or ISO")
+            self.lbl_manual.configure(fg="#e06666")
+            return
+        try:
+            epoch = parse_resume_at(spec)
+        except ValueError as e:
+            self.var_manual_status.set(f"Manual resume: {e}")
+            self.lbl_manual.configure(fg="#e06666")
+            return
+        try:
+            write_manual_request(self.manual_file, epoch,
+                                 bool(self.var_manual_only.get()))
+        except OSError as e:
+            self.var_manual_status.set(f"Manual resume: write failed ({e})")
+            self.lbl_manual.configure(fg="#e06666")
+            return
+        self.var_manual_status.set(
+            f"Manual resume {_fmt_local(epoch)}"
+            + ("  (manual-only)" if self.var_manual_only.get()
+               else "  (backstop: auto on)"))
+        self.lbl_manual.configure(fg="#f0c040")
+
+    def clear_manual(self):
+        """Remove the manual-request file (cancel the scheduled manual resume)."""
+        clear_manual_request(self.manual_file)
+        self.var_manual_entry.set("")
+        self.var_manual_status.set("Manual resume: not set")
+        self.lbl_manual.configure(fg=_SUBFG)
+
+    def _reapply_manual_only(self):
+        """If a manual time is already set, re-write it so a manual-only toggle
+        change takes effect immediately."""
+        mreq = read_manual_request(self.manual_file)
+        if mreq:
+            try:
+                write_manual_request(self.manual_file, mreq["resume_at"],
+                                     bool(self.var_manual_only.get()))
+            except OSError:
+                pass
+
 
 def _watch_thread(args, shared: WatchStatus):
     """Run the watch loop for the GUI, surfacing a fatal crash into the status."""
@@ -1592,7 +2006,9 @@ def run_gui(args):
     t.start()
 
     root = tk.Tk()
-    win = StatusWindow(root, shared, args.stop_file, tick_ms=1000)
+    win = StatusWindow(root, shared, args.stop_file,
+                       manual_file=getattr(args, "manual_file", MANUAL_FILE),
+                       tick_ms=1000)
     win.start()
     try:
         root.mainloop()
@@ -1743,15 +2159,28 @@ def build_argparser():
                         "readable else transcript; usage-api=poll "
                         "/api/oauth/usage (primary); transcript=legacy JSONL "
                         "watcher (fallback)")
-    w.add_argument("--usage-poll", type=int, default=USAGE_POLL_INTERVAL,
-                   help="usage-endpoint poll cadence in seconds (default "
-                        f"{USAGE_POLL_INTERVAL})")
+    w.add_argument("--poll-interval", "--usage-poll", dest="usage_poll", type=int,
+                   default=USAGE_POLL_INTERVAL,
+                   help="DIRECT usage-endpoint poll cadence in seconds (default "
+                        f"{USAGE_POLL_INTERVAL}). Also the fire-on-clear re-poll "
+                        "cadence while armed. (--usage-poll is a legacy alias.)")
     w.add_argument("--monitor-poll", type=int, default=MONITOR_POLL_INTERVAL,
-                   help="backed-off usage poll cadence while the Usage Monitor "
-                        f"app is running (default {MONITOR_POLL_INTERVAL})")
+                   help="DEPRECATED / ignored -- autoresume no longer backs off "
+                        "for the Usage Monitor; it always polls at --poll-interval")
     w.add_argument("--confirm-interval", type=int, default=CONFIRM_INTERVAL,
                    help="re-poll cadence to confirm a reset was applied before "
                         f"injecting (default {CONFIRM_INTERVAL})")
+    w.add_argument("--resume-at", default=None,
+                   help="MANUAL resume time -- fire at this time regardless of "
+                        "API detection. Accepts HH:MM (next occurrence), +Nm "
+                        "(minutes from now; +Nh / +Ns too), or an ISO timestamp. "
+                        "Auto-detection stays on as a backstop unless --manual-only.")
+    w.add_argument("--manual-only", action="store_true",
+                   help="fire ONLY the manual --resume-at / GUI time; suppress "
+                        "usage-API auto-detection while set")
+    w.add_argument("--manual-file", default=MANUAL_FILE,
+                   help="shared manual-request file the GUI and CLI use to schedule "
+                        f"a manual resume time (default {MANUAL_FILE})")
     w.add_argument("--confirm-below", type=float, default=CONFIRM_BELOW,
                    help="a quota's utilization must drop below this %% to confirm "
                         f"its reset (default {CONFIRM_BELOW:g})")

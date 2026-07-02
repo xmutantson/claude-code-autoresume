@@ -347,16 +347,18 @@ def test_parse_resets_at_none_and_garbage():
 
 
 # --------------------------------------------------------------------------- #
-# Monitor-awareness: cadence backs off when the monitor is running            #
+# Fast direct polling: the Usage Monitor NO LONGER changes our cadence         #
+# (v0.3.0 removed the 900s courtesy backoff -- it let a hit+reset slip a gap). #
 # --------------------------------------------------------------------------- #
 
-def test_monitor_present_backs_off_poll_cadence():
+def test_monitor_present_does_not_slow_poll_cadence():
+    # Monitor running MUST NOT back us off any more: we always poll at self.normal.
     src = ar.UsageApiSource(
         _NS(), log=lambda m: None,
         client=FakeClient([SAMPLE_89_38]), monitor_check=lambda p: True,
     )
     src.poll(now=1000.0)
-    assert src._interval == float(src.backoff)
+    assert src._interval == float(src.normal)
 
 
 def test_monitor_absent_uses_normal_cadence():
@@ -366,6 +368,14 @@ def test_monitor_absent_uses_normal_cadence():
     )
     src.poll(now=1000.0)
     assert src._interval == float(src.normal)
+
+
+def test_default_poll_cadence_is_fast():
+    # The direct poll cadence default is fast (~30s), not the old ~165s.
+    assert ar.USAGE_POLL_INTERVAL <= 60
+    src = ar.UsageApiSource(_NS(), log=lambda m: None,
+                            client=FakeClient([SAMPLE_89_38]))
+    assert src.normal == float(ar.USAGE_POLL_INTERVAL) or src.normal == ar.USAGE_POLL_INTERVAL
 
 
 # --------------------------------------------------------------------------- #
