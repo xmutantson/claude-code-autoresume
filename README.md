@@ -275,3 +275,9 @@ Improvements:
 | — | kill switch, logging, once-per-reset watermark |
 
 You can leave the old `.ahk` disabled/removed once this is running at logon.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
