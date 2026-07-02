@@ -2,20 +2,33 @@
 """
 autoresume.py -- Claude Code auto-resume on usage-limit reset (Windows).
 
-Watches the active Claude Code session transcript (JSONL) for a usage-limit-hit
-entry, parses which KIND of limit was hit (session / weekly / monthly spend) and
-the reset time (tz-aware), waits until the reset (+ a small buffer), then types a
+Detects when a Claude Code session has hit a usage limit, figures out WHEN that
+limit resets, waits until the reset (+ a small buffer), then types a
 plain-language "automated resume" message into the focused Claude Code chat
-input in VS Code and presses Enter -- so the autonomous session picks
-up where it left off without a human present.
+input in VS Code and presses Enter -- so the autonomous session picks up where
+it left off without a human present.
+
+PRIMARY detection (self-sufficient): poll the authoritative usage endpoint
+    GET https://api.anthropic.com/api/oauth/usage
+(the same source the Usage Monitor for Claude uses; approach adapted from
+jens-duttke/usage-monitor-for-claude, MIT). A quota is blocked when its
+percent/utilization is >= 100; the resets_at timestamp gives the exact reset.
+If the Usage Monitor app is already running, autoresume BACKS OFF its polling so
+it does not double-hit the API -- self-sufficient always, courteous when the
+monitor is up. All credential + network code is isolated in usage_api.py; the
+OAuth token is never logged. See --source.
+
+FALLBACK detection: the legacy transcript watcher (watch the session JSONL for a
+limit-hit line). Kept for machines with no readable credentials; it is no longer
+the default and its transcript-text matching is only used in --source transcript.
 
 Replaces a fixed-time blind-Enter script (the classic "send {Enter} at 1:15am"
-AutoHotkey hack) with limit-aware detection, correct-window targeting,
+AutoHotkey hack) with limit-aware detection, focused-window targeting,
 send-once-per-reset dedup, a kill switch, and full logging.
 
-Design: parse/schedule/dedup in Python (json + datetime + zoneinfo/tzdata);
-injection via pure Win32 SendInput (no third-party deps). An AHK v2 fallback
-injector (inject.ahk) is provided as an alternative.
+Design: detection/schedule/dedup in Python (stdlib: json + datetime + urllib +
+zoneinfo/tzdata); injection via pure Win32 SendInput (no third-party deps). An
+AHK v2 fallback injector (inject.ahk) is provided as an alternative.
 
 No external Python packages are required beyond the standard library plus
 `tzdata` (already present) for zoneinfo on Windows.
@@ -23,17 +36,22 @@ No external Python packages are required beyond the standard library plus
 
 from __future__ import annotations
 
+__version__ = "0.2.0"   # 0.2.0: usage-API detection is now the primary source
+
 import argparse
 import ctypes
 import glob
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
 from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
+
+import usage_api
 
 try:
     from zoneinfo import ZoneInfo
@@ -92,12 +110,24 @@ PREFER_TITLE = ""       # soft tie-breaker when several VS Code windows match:
                         # set to a substring of YOUR workspace title (e.g. your
                         # repo folder name) to disambiguate. Empty = no preference.
 
-BUFFER_SECONDS = 45          # fire at reset + this (reset text is minute-granular,
-                             # server clock can lag). Design brief: +30-60s.
-POLL_INTERVAL = 5            # seconds between transcript polls (coarse, not tight)
+BUFFER_SECONDS = 45          # fire at reset + this (resets_at is exact, but the
+                             # server clock can lag applying the reset). +30-60s.
+POLL_INTERVAL = 5            # loop tick (s): kill-switch / GUI responsiveness. The
+                             # usage-API source rate-limits its OWN network calls
+                             # independently (see below); this is not the API rate.
 MIN_INJECT_INTERVAL = 60     # global backstop: >=60s between any two injections
 STALE_RESET_GRACE = 6 * 3600 # if a reset already passed by more than this, treat
                              # the entry as historical and do NOT inject.
+
+# --- usage-API detection cadence (seconds) --------------------------------- #
+USAGE_POLL_INTERVAL = 165    # normal usage-endpoint poll cadence (~150-180s)
+MONITOR_POLL_INTERVAL = 900  # back off to ~15min when UsageMonitorForClaude.exe is
+                             # running (it is already polling; don't double-hit)
+CONFIRM_INTERVAL = 30        # at fire time, re-poll every this-many-s until the
+                             # server confirms the quota actually reset (<~90%)
+CONFIRM_BELOW = 90.0         # utilization must drop below this to confirm reset
+MONITOR_CACHE_TTL = 60       # cache the tasklist monitor-presence check this long
+USAGE_MONITOR_PROC = "UsageMonitorForClaude.exe"  # the Usage Monitor app image
 
 _LOCALAPPDATA = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
 STATE_DIR = os.path.join(_LOCALAPPDATA, "claude-autoresume")
@@ -382,11 +412,10 @@ def _proc_image_basename(pid: int):
         kernel32.CloseHandle(h)
 
 
-def find_target_window(proc_name=TARGET_PROC, title_substr=TARGET_TITLE,
-                       prefer_substr=PREFER_TITLE):
-    """Return (hwnd, title) of a visible window belonging to `proc_name` whose
-    title contains `title_substr`. Windows containing `prefer_substr` win ties.
-    Returns (None, None) if nothing matches."""
+def _enum_target_windows(proc_name=TARGET_PROC, title_substr=TARGET_TITLE):
+    """Return an ordered list of (hwnd, title) for visible windows belonging to
+    `proc_name` whose title contains `title_substr`. Order is EnumWindows Z-order
+    (top-most / most-recently-active first)."""
     matches = []
 
     def _cb(hwnd, _lparam):
@@ -401,6 +430,15 @@ def find_target_window(proc_name=TARGET_PROC, title_substr=TARGET_TITLE,
         return True
 
     user32.EnumWindows(WNDENUMPROC(_cb), 0)
+    return matches
+
+
+def find_target_window(proc_name=TARGET_PROC, title_substr=TARGET_TITLE,
+                       prefer_substr=PREFER_TITLE):
+    """Return (hwnd, title) of a matching window, preferring `prefer_substr`, else
+    the first in Z-order. (None, None) if nothing matches. Kept for API stability;
+    the watcher now uses select_target_window (foreground-first)."""
+    matches = _enum_target_windows(proc_name, title_substr)
     if not matches:
         return None, None
     if prefer_substr:
@@ -408,6 +446,65 @@ def find_target_window(proc_name=TARGET_PROC, title_substr=TARGET_TITLE,
             if prefer_substr.lower() in title.lower():
                 return hwnd, title
     return matches[0]
+
+
+def select_target_window(proc_name=TARGET_PROC, title_substr=TARGET_TITLE,
+                         prefer_substr=PREFER_TITLE, log=None):
+    """Pick the injection target FOREGROUND-FIRST (owner: "whichever is currently
+    in focus"). Order of preference:
+
+      1. `prefer_substr` override -- if set and a window's title matches, use it.
+      2. The CURRENT foreground window, if it is one of the matching VS Code
+         windows (right process + title). This is the common case: type into the
+         window the owner left focused.
+      3. If exactly one matching VS Code window exists, use it.
+      4. Otherwise best-effort: the most-recently-active (first in Z-order)
+         matching window, with the ambiguity LOGGED.
+
+    Returns (hwnd, title, reason); (None, None, 'no-target-window') if nothing
+    matches. The caller still runs the foreground guard before typing."""
+    def _log(m):
+        if log:
+            log(m)
+
+    matches = _enum_target_windows(proc_name, title_substr)
+    if not matches:
+        return None, None, "no-target-window"
+
+    if prefer_substr:
+        for hwnd, title in matches:
+            if prefer_substr.lower() in title.lower():
+                return hwnd, title, "prefer-title override"
+
+    fg = user32.GetForegroundWindow()
+    if fg:
+        for hwnd, title in matches:
+            if hwnd == fg:
+                return hwnd, title, "current foreground window"
+
+    if len(matches) == 1:
+        return matches[0][0], matches[0][1], "sole VS Code window"
+
+    hwnd, title = matches[0]
+    _log(f"AMBIGUOUS target: {len(matches)} VS Code windows and none is in "
+         f"focus; best-effort using most-recent {title!r}")
+    return hwnd, title, "best-effort most-recent (ambiguous)"
+
+
+def usage_monitor_running(proc_name=USAGE_MONITOR_PROC) -> bool:
+    """True iff a process image named `proc_name` (the Usage Monitor for Claude
+    app) is running. psutil-free: uses `tasklist` on Windows, returns False
+    elsewhere. Best-effort -- any failure reads as 'not running'."""
+    if os.name != "nt":
+        return False
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {proc_name}", "/NH"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:  # noqa: BLE001 - process probe is best-effort
+        return False
+    return proc_name.lower() in (out.stdout or "").lower()
 
 
 def _kb(wVk, wScan, flags) -> INPUT:
@@ -578,11 +675,13 @@ def inject_message(message: str, proc_name=TARGET_PROC, title_substr=TARGET_TITL
         if log:
             log(msg)
 
-    hwnd, title = find_target_window(proc_name, title_substr, prefer_substr)
+    hwnd, title, reason = select_target_window(proc_name, title_substr,
+                                               prefer_substr, log=log)
     if not hwnd:
         _log(f"ABORT inject: no target window (proc={proc_name} "
              f"title~{title_substr!r})")
         return False, "no-target-window"
+    _log(f"TARGET window {title!r} ({reason})")
 
     # Correct-window guard, with one activation retry.
     ok, fg_title = foreground_matches(proc_name, title_substr)
@@ -777,19 +876,251 @@ class Tailer:
 
 
 # --------------------------------------------------------------------------- #
+# Detection sources                                                            #
+#                                                                              #
+# A source turns "is the account currently limited, and when does it reset?"   #
+# into a uniform stream of HIT dicts the watch loop schedules. Two sources:    #
+#   UsageApiSource  (primary)  -- polls the authoritative usage endpoint.      #
+#   TranscriptSource (fallback) -- tails the session JSONL for a limit-hit.    #
+#                                                                              #
+# HIT dict shape (both sources):                                               #
+#   {"kind": <label>, "reset_str": <human str | None>,                         #
+#    "reset_epoch": <float | None>, "meta": <dict>, "text": <raw | optional>}  #
+# reset_epoch=None AND reset_str=None -> a cap with no timed reset (spend /     #
+# monthly): the loop logs "cannot auto-resume" and skips it.                   #
+#                                                                              #
+# Each source also answers:                                                    #
+#   confirm_reset(pending, log) -> (bool, detail): at fire time, has the reset  #
+#       actually been applied? (usage-API re-polls; transcript can't, so True.) #
+#   loop_tick(pending, now, args) -> float: seconds to sleep before next tick.  #
+# --------------------------------------------------------------------------- #
+
+
+class TranscriptSource:
+    """FALLBACK source: tail the session transcript JSONL for a limit-hit line.
+
+    This is the legacy detector. Its text matching is only reachable in
+    --source transcript, so the transcript self-contamination false-arm class is
+    impossible in the default (usage-api) path."""
+
+    def __init__(self, args, log):
+        self.args = args
+        self.log = log
+        self.tailer = Tailer(args.watch_dir, from_start=args.from_start, log=log)
+
+    def label(self):
+        return "transcript"
+
+    def poll(self, now=None):
+        # Tailer already returns parsed {kind, reset_str, text, timestamp} dicts;
+        # reset_epoch is resolved from reset_str by the watch loop.
+        return list(self.tailer.poll())
+
+    def confirm_reset(self, pending, log):
+        # The transcript has no live usage counter to re-poll; the parsed reset
+        # time has already passed, so fire.
+        return True, "transcript (no live re-poll; reset time elapsed)"
+
+    def loop_tick(self, pending, now, args):
+        return args.poll
+
+
+class UsageApiSource:
+    """PRIMARY source: poll GET /api/oauth/usage and arm on percent >= 100.
+
+    Rate-limits its OWN network calls independently of the watch loop tick:
+    ~USAGE_POLL_INTERVAL normally, backing off to ~MONITOR_POLL_INTERVAL while
+    the Usage Monitor app is running (it already polls -- don't double-hit). At
+    fire time it RE-POLLS to confirm the server actually applied the reset before
+    injecting (utilization dropped below the confirm threshold)."""
+
+    def __init__(self, args, log, client=None, monitor_check=None):
+        self.args = args
+        self.log = log
+        self.client = client if client is not None else usage_api.UsageClient(
+            cred_path=getattr(args, "cred_path", None)
+        )
+        self._monitor_check = monitor_check or usage_monitor_running
+        self.normal = getattr(args, "usage_poll", USAGE_POLL_INTERVAL)
+        self.backoff = getattr(args, "monitor_poll", MONITOR_POLL_INTERVAL)
+        self.confirm_below = getattr(args, "confirm_below", CONFIRM_BELOW)
+        self.monitor_proc = getattr(args, "usage_monitor_proc", USAGE_MONITOR_PROC)
+        self.on_auth_expired = getattr(args, "on_auth_expired", "log")
+        self._last_fetch = 0.0
+        self._interval = 0.0                 # 0 -> first poll fetches immediately
+        self._monitor_cache = (0.0, False)   # (checked_at, running)
+        self._monitor_logged = None          # last-logged monitor state (dedup)
+        self._auth_update_done = False
+
+    def label(self):
+        return "usage-api"
+
+    def _monitor_running(self, now):
+        ts, val = self._monitor_cache
+        if now - ts >= MONITOR_CACHE_TTL:
+            val = bool(self._monitor_check(self.monitor_proc))
+            self._monitor_cache = (now, val)
+            if val != self._monitor_logged:
+                if val:
+                    self.log(f"MONITOR {self.monitor_proc} running -> backing off "
+                             f"usage polls to {self.backoff}s (courtesy)")
+                else:
+                    self.log(f"MONITOR {self.monitor_proc} not running -> normal "
+                             f"usage poll cadence {self.normal}s")
+                self._monitor_logged = val
+        return val
+
+    def _to_hit(self, quota):
+        ra = quota.get("resets_at")
+        reset_epoch = ra.timestamp() if ra else None
+        reset_str = None
+        if ra:
+            # Human, machine-local reset string for the resume message + log.
+            reset_str = datetime.fromtimestamp(reset_epoch).strftime(
+                "%b %d %H:%M %Z").strip() or quota.get("resets_at_str")
+        return {
+            "kind": quota["label"],
+            "reset_str": reset_str,
+            "reset_epoch": reset_epoch,
+            "meta": quota,
+            "text": (f"usage-api: {quota['label']} {quota.get('percent')}% "
+                     f"(severity={quota.get('severity')}, "
+                     f"resets_at={quota.get('resets_at_str')})"),
+        }
+
+    def _fetch(self):
+        """Fetch usage, mapping typed errors to a backoff + returning None."""
+        try:
+            usage = self.client.fetch()
+        except usage_api.NoCredentials:
+            self._interval = self.normal
+            self.log("usage-api: credentials not readable; will retry")
+            return None
+        except usage_api.AuthExpired:
+            self._interval = self.normal
+            self.log("usage-api: HTTP 401 auth expired (token needs refresh); "
+                     "non-fatal, will retry")
+            if self.on_auth_expired == "update" and not self._auth_update_done:
+                self._auth_update_done = True
+                try:
+                    subprocess.Popen(["claude", "update"])
+                    self.log("usage-api: launched 'claude update' to refresh auth")
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"usage-api: could not launch 'claude update' ({e!r})")
+            return None
+        except usage_api.RateLimited as e:
+            ra = e.retry_after if e.retry_after else 60.0
+            self._interval = max(30.0, min(ra, float(self.backoff)))
+            self.log(f"usage-api: HTTP 429 rate_limited; backing off "
+                     f"{int(self._interval)}s (Retry-After={e.retry_after})")
+            return None
+        except usage_api.ServerError as e:
+            self._interval = min(float(self.normal), 60.0)
+            self.log(f"usage-api: {e}; retrying in {int(self._interval)}s")
+            return None
+        except usage_api.ConnectionFailed as e:
+            self._interval = min(float(self.normal), 60.0)
+            self.log(f"usage-api: connection error ({e}); "
+                     f"retrying in {int(self._interval)}s")
+            return None
+        except usage_api.UsageAPIError as e:
+            self._interval = min(float(self.normal), 60.0)
+            self.log(f"usage-api: {e}; retrying in {int(self._interval)}s")
+            return None
+        return usage
+
+    def poll(self, now=None):
+        now = time.time() if now is None else now
+        if self._last_fetch and (now - self._last_fetch) < self._interval:
+            return []                       # respect our own polling cadence
+        self._last_fetch = now
+        usage = self._fetch()
+        if usage is None:
+            return []                       # error path already set the backoff
+        # Success: set the NEXT cadence (courtesy backoff if the monitor is up).
+        self._interval = float(self.backoff if self._monitor_running(now)
+                               else self.normal)
+        blocked = usage_api.find_blocked_quotas(usage)
+        return [self._to_hit(q) for q in blocked]
+
+    def confirm_reset(self, pending, log):
+        """RE-POLL at fire time: is the pending quota actually reset yet?"""
+        meta = pending.get("meta") or {"label": pending.get("kind")}
+        try:
+            usage = self.client.fetch()
+        except usage_api.RateLimited:
+            return False, "HTTP 429 at confirm (still rate-limited); waiting"
+        except usage_api.UsageAPIError as e:
+            return False, f"confirm fetch failed ({e}); waiting"
+        if usage_api.is_quota_reset(usage, meta, below=self.confirm_below):
+            return True, f"utilization dropped below {self.confirm_below:g}%"
+        return False, (f"utilization still >= {self.confirm_below:g}%; "
+                       f"reset not applied yet")
+
+    def loop_tick(self, pending, now, args):
+        # Stay responsive near a scheduled reset (so confirm retries + GUI feel
+        # prompt); otherwise a coarse tick is fine (network is rate-limited above).
+        if pending is not None:
+            remaining = float(pending["fire_at"]) - now
+            if remaining <= 300:
+                return min(args.poll, CONFIRM_INTERVAL)
+        return args.poll
+
+
+def select_source(args, log, creds_available=None):
+    """Pick the detection source per --source.
+
+      auto        -> usage-api if credentials are readable, else transcript.
+      usage-api   -> usage-api; if no credentials, log + fall back to transcript
+                     (never leave an autonomous watcher dead).
+      transcript  -> the legacy transcript watcher (explicit opt-in).
+
+    `creds_available` is injectable for tests; defaults to the real check."""
+    check = creds_available or (
+        lambda: usage_api.credentials_available(getattr(args, "cred_path", None))
+    )
+    src = getattr(args, "source", "auto")
+
+    if src == "transcript":
+        log("SOURCE transcript (explicit) -- legacy fallback detector")
+        return TranscriptSource(args, log)
+
+    if src == "usage-api":
+        if check():
+            log("SOURCE usage-api (explicit) -- polling /api/oauth/usage")
+            return UsageApiSource(args, log)
+        log("SOURCE usage-api requested but no readable credentials; "
+            "falling back to transcript")
+        return TranscriptSource(args, log)
+
+    # auto
+    if check():
+        log("SOURCE auto -> usage-api (credentials readable); polling "
+            "/api/oauth/usage")
+        return UsageApiSource(args, log)
+    log("SOURCE auto -> transcript (no readable credentials); using the legacy "
+        "transcript watcher")
+    return TranscriptSource(args, log)
+
+
+# --------------------------------------------------------------------------- #
 # Main watch loop                                                              #
 # --------------------------------------------------------------------------- #
 
 
-def run_watch(args, shared=None):
-    """Watch the transcript and auto-resume on reset.
+def run_watch(args, shared=None, source=None):
+    """Detect a usage-limit block and auto-resume on reset.
+
+    Detection is delegated to a SOURCE (usage-api primary / transcript fallback,
+    chosen per --source; injectable for tests). The loop is source-agnostic: it
+    schedules the pending injection at reset+buffer, RE-CONFIRMS via the source
+    that the reset was actually applied before firing, dedups once-per-reset, and
+    guards the injection.
 
     `shared` is an optional WatchStatus the GUI reads: when provided, the loop
-    PUBLISHES its state transitions to it (WATCHING/PENDING/FIRING/DONE + the
-    fire_at the GUI counts down to) and honours GUI requests (cancel / inject-now)
-    without forking any detection/parse/inject logic. When `shared` is None the
-    behaviour is identical to before -- the headless path used by Task Scheduler
-    and the tests is unchanged."""
+    PUBLISHES its state transitions (WATCHING/PENDING/FIRING/DONE + the fire_at
+    the GUI counts down to) and honours GUI requests (cancel / inject-now)
+    without forking any detection/inject logic."""
     def publish(**kw):
         if shared is not None:
             shared.update(**kw)
@@ -799,20 +1130,22 @@ def run_watch(args, shared=None):
         if shared is not None:
             shared.set_last_log(m)
 
-    log(f"START autoresume watch dir={args.watch_dir} buffer={args.buffer}s "
-        f"injector={args.injector} dry_run={args.dry_run}")
+    src = source if source is not None else select_source(args, log)
+    log(f"START autoresume v{__version__} source={src.label()} "
+        f"buffer={args.buffer}s injector={args.injector} dry_run={args.dry_run}")
     stop_path = args.stop_file
     if stop_path and os.path.exists(stop_path):
         log(f"NOTE kill switch present at {stop_path}; injection disabled until removed")
     publish(state="WATCHING", stopped=bool(stop_path and os.path.exists(stop_path)))
 
     state = load_state(args.state_file)
-    tailer = Tailer(args.watch_dir, from_start=args.from_start, log=log)
     last_inject_time = 0.0
+    confirm_interval = getattr(args, "confirm_interval", CONFIRM_INTERVAL)
 
-    # Pending injection: dict(kind, reset_str, reset_epoch, key, fire_at)
+    # Pending injection: dict(kind, reset_str, reset_epoch, key, fire_at, meta)
     pending = None
-    kill_logged = False   # log kill-switch HOLD only on state change (no spam)
+    kill_logged = False       # log kill-switch HOLD only on state change (no spam)
+    confirm_wait_logged = False  # log confirm-wait only on change (no spam)
 
     def do_inject(kind, reset_str):
         nonlocal last_inject_time
@@ -844,59 +1177,68 @@ def run_watch(args, shared=None):
                 mark_handled(state, pending["key"])
                 save_state(state, args.state_file)
                 pending = None
+                confirm_wait_logged = False
                 publish(state="WATCHING", fire_at=None, kind=None, reset_str=None,
                         reset_epoch=None, last_action="cancelled pending reset")
 
-        for hit in tailer.poll():
-            kind = hit["kind"]
-            if kind == "monthly spend":
-                # No timed reset -> cannot auto-resume. Log once per day (the
-                # retry storm repeats it) via the watermark, then skip.
-                mkey = "monthly spend|" + datetime.now().strftime("%Y-%m-%d")
-                if not is_handled(state, mkey):
-                    log(f"DETECT monthly-spend limit (billing cap) -- CANNOT "
-                        f"auto-resume, skipping. raw={hit['text']!r}")
-                    mark_handled(state, mkey)
+        # Discover blocks only while nothing is pending: once we know the reset
+        # time we simply wait for it (the usage-API source would otherwise poll
+        # the endpoint for the whole -- possibly multi-day -- window).
+        if pending is None:
+            for hit in src.poll():
+                kind = hit.get("kind")
+                reset_str = hit.get("reset_str")
+                raw = hit.get("text", reset_str)
+                reset_epoch = hit.get("reset_epoch")
+                if reset_epoch is None and reset_str:
+                    try:
+                        reset_epoch, _dt = resolve_reset_epoch(reset_str)
+                    except Exception as e:  # noqa: BLE001
+                        log(f"WARN could not resolve reset {reset_str!r}: {e}")
+                        continue
+                if reset_epoch is None:
+                    # A cap with no timed reset (spend / monthly). Cannot
+                    # auto-resume; log once per day (retry storms repeat it).
+                    mkey = f"{kind}|" + datetime.now().strftime("%Y-%m-%d")
+                    if not is_handled(state, mkey):
+                        log(f"DETECT {kind} (no timed reset / billing cap) -- "
+                            f"CANNOT auto-resume, skipping. raw={raw!r}")
+                        mark_handled(state, mkey)
+                        save_state(state, args.state_file)
+                    continue
+                key = handled_key(kind, reset_epoch)
+                local_str = datetime.fromtimestamp(reset_epoch).isoformat(timespec="seconds")
+                log(f"DETECT {kind} limit; reset_reported={reset_str!r} "
+                    f"resolved_local={local_str} key={key}")
+                if is_handled(state, key):
+                    log(f"SKIP already handled {key} (dedup, once per reset)")
+                    continue
+                now = time.time()
+                if reset_epoch < now - args.stale_grace:
+                    log(f"SKIP stale reset {key} (already passed > "
+                        f"{args.stale_grace}s ago; historical entry)")
+                    mark_handled(state, key)
                     save_state(state, args.state_file)
-                continue
-            if not hit["reset_str"]:
-                log(f"DETECT {kind} limit but no reset string; skipping. "
-                    f"raw={hit['text']!r}")
-                continue
-            try:
-                reset_epoch, reset_dt = resolve_reset_epoch(hit["reset_str"])
-            except Exception as e:  # noqa: BLE001
-                log(f"WARN could not resolve reset {hit['reset_str']!r}: {e}")
-                continue
-            key = handled_key(kind, reset_epoch)
-            local_str = datetime.fromtimestamp(reset_epoch).isoformat(timespec="seconds")
-            log(f"DETECT {kind} limit; reset_reported={hit['reset_str']!r} "
-                f"resolved_local={local_str} key={key}")
-            if is_handled(state, key):
-                log(f"SKIP already handled {key} (retry-storm dedup)")
-                continue
-            now = time.time()
-            if reset_epoch < now - args.stale_grace:
-                log(f"SKIP stale reset {key} (already passed > "
-                    f"{args.stale_grace}s ago; historical entry)")
-                mark_handled(state, key)
-                save_state(state, args.state_file)
-                continue
-            fire_at = reset_epoch + args.buffer
-            # Prefer the latest (largest fire_at) if multiple pend.
-            if pending is None or fire_at > pending["fire_at"]:
-                pending = {
-                    "kind": kind, "reset_str": hit["reset_str"],
-                    "reset_epoch": reset_epoch, "key": key, "fire_at": fire_at,
-                }
-                log(f"PENDING inject {key} at {datetime.fromtimestamp(fire_at).isoformat(timespec='seconds')} "
-                    f"(reset+{args.buffer}s)")
-                publish(state="PENDING", kind=kind, reset_str=hit["reset_str"],
-                        reset_epoch=reset_epoch, fire_at=fire_at)
+                    continue
+                fire_at = reset_epoch + args.buffer
+                # Prefer the latest (largest fire_at) if multiple quotas block:
+                # the account stays limited until the LAST of them resets.
+                if pending is None or fire_at > pending["fire_at"]:
+                    pending = {
+                        "kind": kind, "reset_str": reset_str,
+                        "reset_epoch": reset_epoch, "key": key, "fire_at": fire_at,
+                        "meta": hit.get("meta"),
+                    }
+                    confirm_wait_logged = False
+                    log(f"PENDING inject {key} at "
+                        f"{datetime.fromtimestamp(fire_at).isoformat(timespec='seconds')} "
+                        f"(reset+{args.buffer}s)")
+                    publish(state="PENDING", kind=kind, reset_str=reset_str,
+                            reset_epoch=reset_epoch, fire_at=fire_at)
 
         # GUI request: fire the current pending injection immediately (bypass the
-        # remaining countdown). Still routed through the SAME guarded do_inject
-        # below -- never a second unguarded path. Ignored while kill-switched.
+        # remaining countdown AND the reset-confirm re-poll -- the owner asked for
+        # it explicitly). Still routed through the SAME guarded do_inject below.
         force_now = bool(shared is not None and shared.take_inject_now())
 
         # Fire pending injection when due.
@@ -920,8 +1262,25 @@ def run_watch(args, shared=None):
                 if is_handled(state, key):
                     log(f"SKIP {key} became handled before fire")
                     pending = None
+                    confirm_wait_logged = False
                     publish(state="DONE", fire_at=None)
                     continue
+                # Reset-confirm: the reset time has arrived, but the server may
+                # not have APPLIED the reset yet. Ask the source to confirm
+                # (usage-API re-polls; transcript returns True). Skip on force_now.
+                if not force_now:
+                    confirmed, detail = src.confirm_reset(pending, log)
+                    if not confirmed:
+                        if not confirm_wait_logged:
+                            log(f"WAIT {key}: reset not applied yet ({detail}); "
+                                f"re-checking every {confirm_interval}s")
+                            confirm_wait_logged = True
+                        publish(state="PENDING",
+                                last_action=f"reset not applied yet ({detail})")
+                        # Re-poll cadence until the server applies the reset.
+                        time.sleep(max(1, confirm_interval))
+                        continue
+                    confirm_wait_logged = False
                 log(f"FIRE inject {key} (kind={pending['kind']})"
                     + (" [inject-now]" if force_now else ""))
                 publish(state="FIRING")
@@ -939,8 +1298,9 @@ def run_watch(args, shared=None):
                     time.sleep(args.poll)
                     continue
                 pending = None
+                confirm_wait_logged = False
 
-        time.sleep(args.poll)
+        time.sleep(src.loop_tick(pending, time.time(), args))
 
 
 # --------------------------------------------------------------------------- #
@@ -1375,10 +1735,38 @@ def build_argparser():
                         default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                              "inject.ahk"))
 
-    w = sub.add_parser("watch", help="watch transcript and auto-resume on reset")
+    w = sub.add_parser("watch", help="detect a usage-limit block and auto-resume")
     add_common(w)
+    w.add_argument("--source", choices=["auto", "usage-api", "transcript"],
+                   default="auto",
+                   help="detection source. auto=usage-api if credentials are "
+                        "readable else transcript; usage-api=poll "
+                        "/api/oauth/usage (primary); transcript=legacy JSONL "
+                        "watcher (fallback)")
+    w.add_argument("--usage-poll", type=int, default=USAGE_POLL_INTERVAL,
+                   help="usage-endpoint poll cadence in seconds (default "
+                        f"{USAGE_POLL_INTERVAL})")
+    w.add_argument("--monitor-poll", type=int, default=MONITOR_POLL_INTERVAL,
+                   help="backed-off usage poll cadence while the Usage Monitor "
+                        f"app is running (default {MONITOR_POLL_INTERVAL})")
+    w.add_argument("--confirm-interval", type=int, default=CONFIRM_INTERVAL,
+                   help="re-poll cadence to confirm a reset was applied before "
+                        f"injecting (default {CONFIRM_INTERVAL})")
+    w.add_argument("--confirm-below", type=float, default=CONFIRM_BELOW,
+                   help="a quota's utilization must drop below this %% to confirm "
+                        f"its reset (default {CONFIRM_BELOW:g})")
+    w.add_argument("--usage-monitor-proc", default=USAGE_MONITOR_PROC,
+                   help="process image name of the Usage Monitor app to detect")
+    w.add_argument("--on-auth-expired", choices=["log", "update"], default="log",
+                   help="on HTTP 401: just log (default), or launch 'claude "
+                        "update' once to refresh the token")
+    w.add_argument("--cred-path", default=None,
+                   help="override the credentials file path (default "
+                        "$CLAUDE_CONFIG_DIR/.credentials.json or "
+                        "~/.claude/.credentials.json)")
     w.add_argument("--from-start", action="store_true",
-                   help="parse the transcript from the beginning (default: tail from EOF)")
+                   help="transcript source only: parse from the beginning "
+                        "(default: tail from EOF)")
     w.add_argument("--dry-run", action="store_true",
                    help="detect+log but never type into any window")
     w.add_argument("--gui", action="store_true",
