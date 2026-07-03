@@ -57,7 +57,9 @@ No external Python packages are required beyond the standard library plus
 
 from __future__ import annotations
 
-__version__ = "0.3.0"   # 0.3.0: fast direct polling (no monitor backoff),
+__version__ = "0.3.1"   # 0.3.1: fix Inject-now button doing nothing in plain
+                        #        watching mode (fire a manual inject with no pending);
+                        # 0.3.0: fast direct polling (no monitor backoff),
                         #        arm-on-hit/fire-on-clear state machine (persisted
                         #        across restarts), GUI + CLI manual resume time
 
@@ -1547,6 +1549,29 @@ def run_watch(args, shared=None, source=None):
         # remaining countdown AND the reset-confirm re-poll -- the owner asked for
         # it explicitly). Still routed through the SAME guarded do_inject below.
         force_now = bool(shared is not None and shared.take_inject_now())
+
+        # GUI "Inject now" with NO armed window (plain watching mode): the button
+        # used to do nothing here, because the entire fire block below is gated on
+        # `pending is not None`. Fire an immediate manual inject in that case.
+        if force_now and pending is None:
+            if stopped:
+                if not kill_logged:
+                    log(f"HOLD inject-now: kill switch present at {args.stop_file}; "
+                        f"remove it and click again to inject")
+                    kill_logged = True
+                publish(last_action="inject-now held (kill switch)")
+            else:
+                kill_logged = False
+                log("FIRE inject-now (manual; no pending window)")
+                publish(state="FIRING")
+                ok = do_inject("manual", _fmt_local(time.time()))
+                log("DONE inject-now injected" if ok
+                    else "inject-now FAILED (injector returned False -- check the "
+                         "target window title/proc and focus_method)")
+                publish(state="WATCHING",
+                        last_action="manual inject-now" if ok
+                        else "inject-now FAILED")
+            force_now = False   # consumed; the pending branch handles pending!=None
 
         # ---- AUTO FIRE: fire when the armed window CLEARS or its time arrives - #
         if not manual_only and pending is not None:
