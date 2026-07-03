@@ -62,7 +62,12 @@ No external Python packages are required beyond the standard library plus
 
 from __future__ import annotations
 
-__version__ = "0.5.0"   # 0.5.0: fix the shared-token HTTP 429 + a stuck-arm bug.
+__version__ = "0.5.1"   # 0.5.1: stop the periodic console-window FLASH on Windows
+                        #        — every shell-out (tasklist monitor-check on a ~60s
+                        #        timer, claude --version, cscript, AHK) now passes
+                        #        CREATE_NO_WINDOW so no console window pops under
+                        #        pythonw;
+                        # 0.5.0: fix the shared-token HTTP 429 + a stuck-arm bug.
                         #        ADAPTIVE polling: idle ~180s; while ARMED sleep to
                         #        near the known reset then poll fast (~10-50x fewer
                         #        requests). Real 429 backoff: honor Retry-After in
@@ -217,6 +222,12 @@ STOP_FILE = os.path.join(_TEMP_DIR, "autoresume.stop")
 # Manual-resume-time request file (GUI + CLI shared IPC, same filesystem pattern
 # as the kill-switch stop-file): JSON {"resume_at": <epoch>, "manual_only": bool}.
 MANUAL_FILE = os.path.join(_TEMP_DIR, "autoresume.manual.json")
+
+# Windows: a subprocess of a CONSOLE program (tasklist, claude, cscript, AHK...)
+# flashes a console window even when the watcher runs under pythonw. The monitor
+# check (tasklist) runs on a ~60s timer, so that flash recurs and is distracting.
+# CREATE_NO_WINDOW suppresses it; 0 (no-op) on non-Windows. Pass to every shell-out.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 MONTHS = {
     "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
@@ -604,6 +615,7 @@ def usage_monitor_running(proc_name=USAGE_MONITOR_PROC) -> bool:
         out = subprocess.run(
             ["tasklist", "/FI", f"IMAGENAME eq {proc_name}", "/NH"],
             capture_output=True, text=True, timeout=10,
+            creationflags=_NO_WINDOW,
         )
     except Exception:  # noqa: BLE001 - process probe is best-effort
         return False
@@ -823,7 +835,7 @@ def inject_via_ahk(message: str, ahk_exe: str, ahk_script: str, log=None):
         if log:
             log(f"ABORT inject(ahk): missing exe/script ({ahk_exe} / {ahk_script})")
         return False, "ahk-missing"
-    rc = subprocess.call([ahk_exe, ahk_script, message])
+    rc = subprocess.call([ahk_exe, ahk_script, message], creationflags=_NO_WINDOW)
     if log:
         log(f"inject(ahk) rc={rc}")
     return rc == 0, f"ahk-rc-{rc}"
@@ -1540,7 +1552,7 @@ class UsageApiSource:
             if self.on_auth_expired == "update" and not self._auth_update_done:
                 self._auth_update_done = True
                 try:
-                    subprocess.Popen(["claude", "update"])
+                    subprocess.Popen(["claude", "update"], creationflags=_NO_WINDOW)
                     self.log("usage-api: launched 'claude update' to refresh auth")
                 except Exception as e:  # noqa: BLE001
                     self.log(f"usage-api: could not launch 'claude update' ({e!r})")
@@ -2496,7 +2508,8 @@ def cmd_install_shortcut(args):
     try:
         with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(vbs)
-        rc = subprocess.call(["cscript", "//nologo", "//b", tmp])
+        rc = subprocess.call(["cscript", "//nologo", "//b", tmp],
+                             creationflags=_NO_WINDOW)
         if rc == 0 and os.path.exists(lnk):
             print(f"created Desktop shortcut: {lnk}")
             return 0

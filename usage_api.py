@@ -56,6 +56,10 @@ USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 ANTHROPIC_BETA = "oauth-2025-04-20"
 DEFAULT_CLI_VERSION = "2.1.85"          # User-Agent fallback if `claude --version` fails
 
+# Windows: suppress the console-window flash a subprocess of a console program
+# (claude --version) makes even under pythonw. 0 (no-op) on non-Windows.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 BLOCK_THRESHOLD = 100.0                 # percent/utilization >= this -> BLOCKED
 RESET_CONFIRM_BELOW = 90.0              # at fire time, quota must drop below this
                                         # to confirm the server applied the reset
@@ -142,7 +146,8 @@ def detect_cli_version(fallback: str = DEFAULT_CLI_VERSION) -> str:
     ``claude-code/<version>`` User-Agent. Falls back to `fallback` on any error."""
     try:
         out = subprocess.run(
-            ["claude", "--version"], capture_output=True, text=True, timeout=10
+            ["claude", "--version"], capture_output=True, text=True, timeout=10,
+            creationflags=_NO_WINDOW,
         )
         m = _VERSION_RE.search((out.stdout or "") + (out.stderr or ""))
         if m:
