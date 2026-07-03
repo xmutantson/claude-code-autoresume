@@ -172,7 +172,59 @@ across restarts, and fires exactly once (deduped like an auto reset).
 
 ## Injection mechanism & fail-safes
 
-**Primary:** pure Win32 `SendInput` via `ctypes` — no third-party packages. It
+### `--injector uri` — target the EXACT session tab *(default, v0.4.0+)*
+
+One VS Code window can hold **multiple** Claude Code session tabs. The keystroke
+injector below focuses a *window* and types into whichever tab is active — so it
+can land in the **wrong conversation**. The URI injector fixes this natively.
+Claude Code's VS Code extension exposes a deep link
+([docs](https://code.claude.com/docs/en/vs-code#launch-a-vs-code-tab-from-other-tools)):
+
+```
+vscode://anthropic.claude-code/open?session=<SESSION_ID>&prompt=<URL_ENCODED_MESSAGE>
+```
+
+- `session=<ID>` **focuses that exact tab** (opening it in the focused window's
+  workspace if it isn't already open) — precise, no tab guessing.
+- `prompt=<...>` **pre-fills** the chat input. It is **not** auto-submitted, so
+  autoresume sends exactly **one** Enter to submit (reusing the correct-window
+  guard, so it never Enters into a non-VS-Code window).
+
+What autoresume does per fire:
+
+1. Derive the target — **session id** = the newest (or tailed) transcript's
+   filename minus `.jsonl`; **workspace folder** = `basename` of that session's
+   most-recent `cwd` field (the substring that appears in the VS Code window
+   title). Override either with `--session-id` / `--workspace-title`.
+2. Foreground the correct VS Code window (so the session opens in the right
+   workspace — a session id from *another* workspace would start a fresh chat).
+3. Fire the URI via `ShellExecuteW(open)` (ctypes; **not** a shell string).
+4. Settle ~0.5 s for the tab to focus + pre-fill, then send one guarded Enter.
+
+**Caveats (handled / documented):**
+
+- **Pre-fill is not submitted** by the URI itself → the single Enter submits it.
+  If a one-time confirmation (*"open external app?" / "switch apps?"*) intercepts
+  that first Enter, pass **`--uri-extra-enter`** to send a second Enter, or
+  (recommended) tick **"always allow"** once so the prompt never reappears.
+- **The session must belong to the focused window's workspace**, else the
+  extension opens a **fresh** conversation — so window targeting still matters
+  (step 2). `--workspace-title` forces the disambiguator; `basename(cwd)` is a
+  heuristic (it can read a *subfolder* name if the session `cd`'d into one — but
+  it usually substring-matches the workspace title anyway, and `session=<id>`
+  still focuses the exact tab regardless of which window is foregrounded).
+- **Requires a recent extension build** that understands the `session` param. On
+  an older build the URI is a no-op (nothing pre-fills); the fire is logged so a
+  silent no-op is diagnosable. Fall back with `--injector win32`.
+- `--dry-run` (watch) and `inject-now --dry-run` **log the exact URI** without
+  firing it — verify the `session=` and url-encoded `prompt=` before going live.
+
+`--injector win32` restores the legacy keystroke path below; `--injector ahk`
+uses the AutoHotkey fallback.
+
+### `--injector win32` — legacy keystroke path *(fallback)*
+
+**Mechanism:** pure Win32 `SendInput` via `ctypes` — no third-party packages. It
 targets **the window currently in focus** (owner: "whichever is currently in
 focus") and types into it. Window pick, in order:
 
@@ -280,10 +332,11 @@ State, log, kill-switch, and manual-request locations:
   `$CLAUDE_CONFIG_DIR/.credentials.json`) for the primary usage-API source. If
   none is readable, `--source auto` falls back to the transcript watcher.
 - Claude Code running as the **VS Code extension** (chat panel — the owner's
-  setup). The `ctrl+alt+shift+k` → `claude-vscode.focus` keybinding must be
-  present in `keybindings.json` when using the default `--focus-method keybind`
-  (see "Focusing the Claude Code chat input" above); otherwise use
-  `--focus-method palette`.
+  setup). The default **`--injector uri`** targets the exact session tab via the
+  extension's deep link and needs **no keybinding**. The `ctrl+alt+shift+k` →
+  `claude-vscode.focus` keybinding is only required for the legacy
+  **`--injector win32`** path with `--focus-method keybind` (see "Focusing the
+  Claude Code chat input" above); otherwise use `--focus-method palette`.
 - The **Usage Monitor for Claude** app is **not required** and no longer changes
   autoresume's behaviour (its presence is only logged); autoresume polls the
   endpoint directly. Optional: AutoHotkey v2 (for `--injector ahk`), at
@@ -325,8 +378,11 @@ Useful options (`watch`):
 | `--confirm-below PCT` | 90 | utilization must drop below this to count as cleared |
 | `--on-auth-expired {log,update}` | log | on HTTP 401: log, or run `claude update` once |
 | `--cred-path PATH` | auto | override the credentials file path |
-| `--injector {win32,ahk}` | win32 | keystroke mechanism |
-| `--focus-method {keybind,palette,none}` | keybind | how to focus the Claude Code chat input before typing |
+| `--injector {uri,win32,ahk}` | **uri** | injection mechanism: `uri` targets the exact session tab via the deep link (default); `win32` = legacy keystroke; `ahk` = AutoHotkey |
+| `--session-id ID` | (auto) | uri: force the Claude Code session id (default: derive from the newest/tailed transcript) |
+| `--workspace-title SUBSTR` | (auto) | uri: force the VS Code workspace-folder substring used to focus the right window (default: `basename` of the session's `cwd`) |
+| `--uri-extra-enter` | off | uri: send a **second** Enter (for setups where a one-time "open external app?" confirmation eats the first) |
+| `--focus-method {keybind,palette,none}` | keybind | `win32` injector only: how to focus the Claude Code chat input before typing |
 | `--prefer-title SUBSTR` | (none) | override: force this VS Code window as the target |
 | `--dry-run` | off | detect + log, but **never** type |
 | `--target-proc` / `--target-title` | `Code.exe` / `Visual Studio Code` | window match |
@@ -372,8 +428,18 @@ the actual injection always stays the loop’s single guarded path.
 # Parse limit-hit lines from a transcript/fixture and print KIND + resolved reset
 python autoresume.py parse-file tests/fixtures/sample_limit_hits.jsonl
 
-# Inject a message into a window right now (test the keystroke path)
-python autoresume.py inject-now "hello from autoresume" --target-title "Notepad" --target-proc Notepad.exe
+# Show the exact deep-link URI that WOULD fire (no fire) for a session — verify
+# the session= id and the url-encoded prompt= before going live
+python autoresume.py inject-now --injector uri --dry-run \
+  --session-id "<SESSION_UUID>" --workspace-title "my repo" "hello from autoresume"
+
+# Fire the URI live but do NOT submit (pre-fill only): focuses the exact tab
+python autoresume.py inject-now --injector uri --no-enter \
+  --session-id "<SESSION_UUID>" --workspace-title "my repo" "hello from autoresume"
+
+# Legacy keystroke path (test into e.g. Notepad)
+python autoresume.py inject-now --injector win32 "hello from autoresume" \
+  --target-title "Notepad" --target-proc Notepad.exe
 ```
 
 ---

@@ -57,7 +57,15 @@ No external Python packages are required beyond the standard library plus
 
 from __future__ import annotations
 
-__version__ = "0.3.2"   # 0.3.2: stop un-fullscreening VSCode on inject (only
+__version__ = "0.4.0"   # 0.4.0: URI injector (DEFAULT) -- target the EXACT Claude
+                        #        Code session tab by id via the
+                        #        vscode://anthropic.claude-code/open?session=<ID>
+                        #        &prompt=<URLENCODED> deep link (focuses that tab +
+                        #        pre-fills the prompt; one Enter submits). Replaces
+                        #        the "focus a VS Code window + guess the tab"
+                        #        keystroke path as the default; --injector win32
+                        #        (old keystroke) + ahk remain as fallbacks;
+                        # 0.3.2: stop un-fullscreening VSCode on inject (only
                         #        un-minimize, never SW_RESTORE a maximized window);
                         # 0.3.1: fix Inject-now button doing nothing in plain
                         #        watching mode (fire a manual inject with no pending);
@@ -77,6 +85,7 @@ import threading
 import time
 from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import usage_api
 
@@ -312,6 +321,13 @@ def resolve_reset_epoch(reset_str: str, now: datetime | None = None):
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+# shell32 for ShellExecuteW: fire the vscode:// deep link that focuses the exact
+# Claude Code session tab (the URI injector, the v0.4.0 default). Guarded import
+# so the module still loads (parse/inject unit tests) if shell32 is unavailable.
+try:
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+except Exception:  # pragma: no cover - non-Windows / no shell32
+    shell32 = None  # type: ignore
 
 ULONG_PTR = ctypes.wintypes.WPARAM
 
@@ -325,6 +341,7 @@ VK_SHIFT = 0x10         # Shift
 VK_P = 0x50             # 'P'  (Command Palette)
 VK_K = 0x4B             # 'K'  (dedicated focus keybinding)
 SW_RESTORE = 9
+SW_SHOWNORMAL = 1       # ShellExecuteW nCmdShow for the vscode:// deep link
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 # --------------------------------------------------------------------------- #
@@ -420,6 +437,16 @@ user32.SystemParametersInfoW.argtypes = (
     wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT,
 )
 user32.SystemParametersInfoW.restype = wintypes.BOOL
+
+if shell32 is not None:
+    # HINSTANCE ShellExecuteW(hwnd, lpOperation, lpFile, lpParameters,
+    #                         lpDirectory, nShowCmd). Returns a value > 32 on
+    # success; <= 32 is an error code. HINSTANCE == c_void_p (int or None).
+    shell32.ShellExecuteW.argtypes = (
+        wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
+        wintypes.LPCWSTR, ctypes.c_int,
+    )
+    shell32.ShellExecuteW.restype = wintypes.HINSTANCE
 
 SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000
 SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
@@ -772,6 +799,166 @@ def inject_via_ahk(message: str, ahk_exe: str, ahk_script: str, log=None):
 
 
 # --------------------------------------------------------------------------- #
+# URI injector (v0.4.0 DEFAULT): target the EXACT session tab by id            #
+#                                                                              #
+# The keystroke injectors above focus a VS Code WINDOW and type into whatever  #
+# Claude tab happens to be active -- but one VS Code window can hold MULTIPLE   #
+# Claude session tabs, so the keystrokes can land in the WRONG conversation.   #
+# The Claude Code extension exposes a deep link that targets a session by id:  #
+#                                                                              #
+#   vscode://anthropic.claude-code/open?session=<ID>&prompt=<URLENCODED>       #
+#                                                                              #
+# session=<ID> FOCUSES that exact tab (opening it in the focused window's       #
+# workspace if not already open); prompt= PRE-FILLS the chat input -- it is NOT #
+# auto-submitted, so we send exactly ONE Enter to submit. This makes injection  #
+# tab-precise instead of "a window + a guessed tab".                            #
+# Docs: https://code.claude.com/docs/en/vs-code#launch-a-vs-code-tab-from-      #
+#       other-tools                                                             #
+#                                                                              #
+# CAVEATS (documented + handled below):                                        #
+#  * The pre-fill is NOT submitted by the URI -> the single guarded Enter       #
+#    submits it. If a confirmation ("open external website?" / "switch apps?")  #
+#    intercepts the first Enter, pass --uri-extra-enter to send a second one,   #
+#    or (recommended) check "always allow" once so no dialog appears again.     #
+#  * The session id must belong to the FOCUSED window's workspace, else the     #
+#    extension starts a FRESH conversation -> window targeting still matters,   #
+#    so we foreground the right VS Code window BEFORE firing the URI.           #
+#  * Requires a recent extension build that understands the `session` param. On #
+#    an old build the URI is a no-op (nothing pre-fills); the log records the   #
+#    fire so a silent no-op is diagnosable.                                     #
+# --------------------------------------------------------------------------- #
+
+CLAUDE_URI_BASE = "vscode://anthropic.claude-code/open"
+
+
+def build_resume_uri(session_id: str, message: str) -> str:
+    """Build the Claude Code deep link that focuses session `session_id` and
+    pre-fills `message`. session + prompt are URL-encoded with quote(safe="")
+    so every reserved char (including '/', '&', '=', spaces, the middle-dot in
+    the reset string) is percent-escaped."""
+    return (f"{CLAUDE_URI_BASE}?session=" + quote(session_id or "", safe="")
+            + "&prompt=" + quote(message or "", safe=""))
+
+
+def _shell_execute(url: str) -> int:
+    """Fire `url` via ShellExecuteW(open). Returns the HINSTANCE-ish code
+    (> 32 = success, <= 32 = error). Does NOT go through a shell string, so the
+    URL is passed verbatim to the vscode:// protocol handler."""
+    if shell32 is None:
+        return 0
+    res = shell32.ShellExecuteW(None, "open", url, None, None, SW_SHOWNORMAL)
+    if res is None:
+        return 0
+    try:
+        return int(res)
+    except (TypeError, ValueError):
+        return 0
+
+
+def inject_via_uri(message: str, session_id: str, workspace_title: str,
+                   proc_name=TARGET_PROC, title_substr=TARGET_TITLE,
+                   prefer_substr=None, press_enter=True, settle=0.35,
+                   uri_settle=0.5, extra_enter=False,
+                   shell_execute=None, log=None):
+    """Inject `message` by targeting the EXACT Claude Code session tab.
+
+    Steps:
+      1. Foreground the correct VS Code window (reuse select_target_window /
+         activate_window; prefer_substr defaults to `workspace_title`, the
+         workspace folder derived from the session's cwd). With a single window
+         this is trivial, but it keeps the session opening in the right
+         workspace when several windows exist.
+      2. Fire vscode://anthropic.claude-code/open?session=<id>&prompt=<msg> via
+         ShellExecuteW (NOT a shell string). The extension focuses that exact
+         tab and pre-fills the prompt.
+      3. Settle ~uri_settle s for the tab to focus + pre-fill.
+      4. Send ONE Enter to submit -- reusing the foreground guard so it never
+         Enters into a non-Claude window.
+
+    `shell_execute` is injectable for tests (defaults to the real ShellExecuteW).
+    Returns (ok, detail)."""
+    def _log(m):
+        if log:
+            log(m)
+
+    fire = shell_execute if shell_execute is not None else _shell_execute
+
+    if not session_id:
+        _log("ABORT inject(uri): no session id derivable; cannot target a "
+             "session tab (fall back to --injector win32)")
+        return False, "no-session-id"
+
+    url = build_resume_uri(session_id, message)
+
+    # 1) Foreground the correct VS Code window so the URI opens the session in
+    #    THAT window's workspace (a session id from another workspace would start
+    #    a fresh chat). prefer the workspace folder as the disambiguator.
+    prefer = prefer_substr if prefer_substr is not None else (
+        workspace_title or PREFER_TITLE)
+    hwnd, title, reason = select_target_window(proc_name, title_substr, prefer,
+                                               log=log)
+    fg_ok = False
+    if hwnd:
+        _log(f"TARGET window {title!r} ({reason})")
+        fg_ok, fg_title = foreground_matches(proc_name, title_substr)
+        if not fg_ok:
+            activate_window(hwnd)
+            time.sleep(settle)
+            fg_ok, fg_title = foreground_matches(proc_name, title_substr)
+        if not fg_ok:
+            _log(f"WARN inject(uri): foreground guard failed (fg={fg_title!r}); "
+                 f"firing the URI anyway (session=<id> targets the exact tab, but "
+                 f"if the focused workspace differs the extension may open a fresh "
+                 f"chat)")
+    else:
+        _log(f"WARN inject(uri): no VS Code window matched (proc={proc_name} "
+             f"title~{title_substr!r}); firing the URI to let the OS route it")
+
+    # 2) Fire the deep link.
+    rc = fire(url)
+    if rc <= 32:
+        _log(f"ABORT inject(uri): ShellExecuteW failed rc={rc} for session="
+             f"{session_id}")
+        return False, f"shellexecute-rc-{rc}"
+    _log(f"URI fired: session={session_id} workspace={workspace_title!r} "
+         f"prompt={len(message)} chars rc={rc}")
+
+    # 3) Let the tab focus + the prompt pre-fill settle.
+    time.sleep(uri_settle)
+
+    if not press_enter:
+        _log("inject(uri): prompt PRE-FILLED, Enter suppressed (--no-enter / "
+             "test); submit manually")
+        return True, f"prefilled:{workspace_title or 'uri'}"
+
+    # 4) Submit with ONE Enter -- guarded so we never Enter into a non-VS-Code
+    #    window (the URI may have popped a confirmation that stole focus, or the
+    #    handler brought a different app forward).
+    ok, fg_title = foreground_matches(proc_name, title_substr)
+    if not ok and hwnd:
+        activate_window(hwnd)
+        time.sleep(0.2)
+        ok, fg_title = foreground_matches(proc_name, title_substr)
+    if not ok:
+        _log(f"HOLD inject(uri) Enter: foreground is {fg_title!r}, not VS Code; "
+             f"the URI pre-filled the prompt but NOT submitting (refusing Enter "
+             f"into the wrong window). Submit manually, or use --injector win32.")
+        return True, f"prefilled-not-submitted:{fg_title!r}"
+    time.sleep(0.05)
+    press_vk(VK_RETURN)
+    if extra_enter:
+        # Environments where a one-time "open external app?" confirmation eats
+        # the first Enter: a second Enter (after a short settle) submits the now
+        # pre-filled prompt. Harmless when no dialog appeared (an empty second
+        # submit is a no-op in the Claude input).
+        time.sleep(uri_settle)
+        press_vk(VK_RETURN)
+    _log(f"INJECTED via URI into {fg_title!r}: session={session_id} submitted "
+         f"with {'two Enters' if extra_enter else 'one Enter'}")
+    return True, fg_title
+
+
+# --------------------------------------------------------------------------- #
 # State, logging, kill switch                                                  #
 # --------------------------------------------------------------------------- #
 
@@ -1036,6 +1223,74 @@ def newest_transcript(watch_dir: str):
     if not files:
         return None
     return max(files, key=os.path.getmtime)
+
+
+def session_id_from_path(transcript_path: str):
+    """The Claude Code session id is the transcript filename minus '.jsonl'
+    (e.g. .../<uuid>.jsonl -> <uuid>). Returns None for a falsy path."""
+    if not transcript_path:
+        return None
+    base = os.path.basename(transcript_path)
+    return base[:-6] if base.lower().endswith(".jsonl") else base
+
+
+def read_transcript_cwd(transcript_path: str):
+    """Return the most-recent 'cwd' recorded in a transcript, or None.
+
+    Each transcript line carries a "cwd" field (the session's working dir at that
+    point). The LAST such value is the current cwd; its basename is the VS Code
+    workspace folder (used to focus the right window for the URI injector). Reads
+    only lines that contain the "cwd" token (cheap on a large jsonl)."""
+    if not transcript_path:
+        return None
+    cwd = None
+    try:
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"cwd"' not in line:
+                    continue
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                c = obj.get("cwd")
+                if isinstance(c, str) and c:
+                    cwd = c
+    except OSError:
+        return None
+    return cwd
+
+
+def workspace_title_from_cwd(cwd: str):
+    """The VS Code workspace folder = basename of the session's cwd (the substring
+    that appears in the VS Code window title). Strips trailing separators so a cwd
+    like 'X:\\repo\\' still yields 'repo'. Returns None for a falsy cwd."""
+    if not cwd:
+        return None
+    return os.path.basename(cwd.rstrip("\\/")) or None
+
+
+def derive_session_and_workspace(watch_dir: str, transcript_path=None, log=None):
+    """Return (session_id, workspace_title) for the session the watcher targets.
+
+    Prefers an explicit `transcript_path` (e.g. the one the transcript source is
+    already tailing); else the newest transcript in `watch_dir` -- the session
+    being actively worked in, which is the one that hit the account-wide limit.
+    Either element may be None if not derivable (the caller logs + falls back)."""
+    path = transcript_path or newest_transcript(watch_dir)
+    if not path:
+        if log:
+            log(f"derive session/workspace: no transcript in {watch_dir!r}")
+        return None, None
+    sid = session_id_from_path(path)
+    ws = workspace_title_from_cwd(read_transcript_cwd(path))
+    if log:
+        log(f"derive session/workspace: transcript={os.path.basename(path)} "
+            f"session={sid} workspace={ws!r}")
+    return sid, ws
 
 
 class Tailer:
@@ -1419,15 +1674,49 @@ def run_watch(args, shared=None, source=None):
     confirm_wait_logged = False  # log confirm-wait only on change (no spam)
     last_armed_confirm = 0.0     # last time we network-confirmed while armed
 
+    def _session_workspace():
+        """Resolve (session_id, workspace_title) for the URI injector. Explicit
+        CLI overrides (--session-id / --workspace-title) win; else derive from the
+        transcript the source is tailing (transcript source) or the newest
+        transcript in the watch dir (usage-api source has no tailer)."""
+        sid = getattr(args, "session_id", None)
+        ws = getattr(args, "workspace_title", None)
+        if sid and ws:
+            return sid, ws
+        tailer = getattr(src, "tailer", None)
+        tpath = getattr(tailer, "path", None) if tailer is not None else None
+        d_sid, d_ws = derive_session_and_workspace(args.watch_dir, tpath, log=log)
+        return (sid or d_sid), (ws or d_ws)
+
     def do_inject(kind, reset_str):
         nonlocal last_inject_time
         message = build_message(kind, reset_str)
+        injector = args.injector
+        session_id = workspace_title = None
+        if injector == "uri":
+            session_id, workspace_title = _session_workspace()
+            if not session_id:
+                log("inject(uri): no session id derivable; falling back to "
+                    "--injector win32 (keystroke) for this fire")
+                injector = "win32"
         if args.dry_run:
-            log(f"DRY-RUN would inject ({kind}): {message}")
+            if injector == "uri":
+                url = build_resume_uri(session_id, message)
+                log(f"DRY-RUN would inject via URI (session={session_id} "
+                    f"workspace={workspace_title!r}): {url}")
+            else:
+                log(f"DRY-RUN would inject ({kind}) via {injector}: {message}")
             last_inject_time = time.time()
             return True
-        if args.injector == "ahk":
+        if injector == "ahk":
             ok, detail = inject_via_ahk(message, args.ahk_exe, args.ahk_script, log)
+        elif injector == "uri":
+            ok, detail = inject_via_uri(
+                message, session_id, workspace_title,
+                proc_name=args.target_proc, title_substr=args.target_title,
+                prefer_substr=(args.prefer_title or workspace_title),
+                extra_enter=bool(getattr(args, "uri_extra_enter", False)),
+                log=log)
         else:
             ok, detail = inject_message(
                 message, args.target_proc, args.target_title,
@@ -2137,11 +2426,39 @@ def cmd_parse_file(args):
 
 def cmd_inject_now(args):
     """Inject an arbitrary message into a target window RIGHT NOW (for testing
-    the injection path, e.g. into Notepad)."""
+    the injection path). With --injector uri it targets an EXACT session tab by
+    id (derived, or forced via --session-id / --workspace-title); --dry-run logs
+    the URI without firing it."""
     log = lambda m: log_event(m, args.log_file)
-    if args.injector == "ahk":
+    if args.injector == "uri":
+        session_id = getattr(args, "session_id", None)
+        workspace_title = getattr(args, "workspace_title", None)
+        if not (session_id and workspace_title):
+            d_sid, d_ws = derive_session_and_workspace(args.watch_dir, log=log)
+            session_id = session_id or d_sid
+            workspace_title = workspace_title or d_ws
+        if getattr(args, "dry_run", False):
+            url = build_resume_uri(session_id, args.message)
+            log(f"DRY-RUN would inject via URI (session={session_id} "
+                f"workspace={workspace_title!r}): {url}")
+            print(f"inject ok=True detail=dry-run session={session_id}")
+            print(f"URI: {url}")
+            return 0
+        ok, detail = inject_via_uri(
+            args.message, session_id, workspace_title,
+            proc_name=args.target_proc, title_substr=args.target_title,
+            prefer_substr=(args.prefer_title or workspace_title),
+            press_enter=not args.no_enter,
+            extra_enter=bool(getattr(args, "uri_extra_enter", False)), log=log)
+    elif args.injector == "ahk":
+        if getattr(args, "dry_run", False):
+            print(f"inject ok=True detail=dry-run (ahk) message={args.message!r}")
+            return 0
         ok, detail = inject_via_ahk(args.message, args.ahk_exe, args.ahk_script, log)
     else:
+        if getattr(args, "dry_run", False):
+            print(f"inject ok=True detail=dry-run (win32) message={args.message!r}")
+            return 0
         ok, detail = inject_message(
             args.message, args.target_proc, args.target_title,
             args.prefer_title, press_enter=not args.no_enter,
@@ -2172,7 +2489,25 @@ def build_argparser():
         sp.add_argument("--state-file", default=STATE_FILE)
         sp.add_argument("--log-file", default=LOG_FILE)
         sp.add_argument("--stop-file", default=STOP_FILE)
-        sp.add_argument("--injector", choices=["win32", "ahk"], default="win32")
+        sp.add_argument("--injector", choices=["uri", "win32", "ahk"],
+                        default="uri",
+                        help="injection mechanism. uri (default)=fire the "
+                             "vscode://anthropic.claude-code/open?session=<id> "
+                             "deep link to target the EXACT session tab, then one "
+                             "Enter to submit; win32=legacy keystroke injector "
+                             "(focus a window + type into the active tab); "
+                             "ahk=AutoHotkey v2 fallback")
+        sp.add_argument("--session-id", default=None,
+                        help="uri injector: force this Claude Code session id "
+                             "(default: derive from the newest/tailed transcript)")
+        sp.add_argument("--workspace-title", default=None,
+                        help="uri injector: force the VS Code workspace-folder "
+                             "substring used to focus the right window (default: "
+                             "basename of the session's cwd)")
+        sp.add_argument("--uri-extra-enter", action="store_true",
+                        help="uri injector: send a SECOND Enter after a settle "
+                             "(for setups where a one-time 'open external app?' "
+                             "confirmation eats the first Enter)")
         sp.add_argument("--focus-method", choices=["keybind", "palette", "none"],
                         default=FOCUS_METHOD,
                         help="how to focus the Claude Code chat input before "
@@ -2247,6 +2582,9 @@ def build_argparser():
     add_common(inj)
     inj.add_argument("message")
     inj.add_argument("--no-enter", action="store_true")
+    inj.add_argument("--dry-run", action="store_true",
+                     help="log/print what would be injected (e.g. the exact URI) "
+                          "without firing it")
 
     return p
 
