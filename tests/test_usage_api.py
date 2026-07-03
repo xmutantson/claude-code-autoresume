@@ -136,6 +136,10 @@ def _make_watch_args(tmp_path, **over):
         "--state-file", str(tmp_path / "state.json"),
         "--log-file", str(tmp_path / "log.txt"),
         "--stop-file", str(tmp_path / "stop"),
+        # Isolate the manual-request file to tmp: the default is the shared real
+        # $TEMP/autoresume.manual.json, and a live manual resume set by the owner
+        # would otherwise bleed into these fake-clock loop tests.
+        "--manual-file", str(tmp_path / "manual.json"),
         "--buffer", "5", "--poll", "1", "--min-interval", "0",
         "--confirm-interval", "1",
     ]
@@ -390,3 +394,100 @@ class _NS:
     usage_monitor_proc = ar.USAGE_MONITOR_PROC
     on_auth_expired = "log"
     cred_path = None
+
+
+# --------------------------------------------------------------------------- #
+# (e) v0.5.0: adaptive armed cadence, HTTP 429 backoff, re-arm-still-blocked   #
+# --------------------------------------------------------------------------- #
+
+def test_compute_armed_interval_far_uses_drift():
+    # Far from the reset the account is still blocked -> barely poll (drift cap).
+    assert ar.compute_armed_interval(9516, 30, 600) == 600
+
+
+def test_compute_armed_interval_shrinks_as_reset_nears():
+    # The next confirm lands ~at the reset as fire_at approaches.
+    assert ar.compute_armed_interval(120, 30, 600) == 120
+    assert ar.compute_armed_interval(45, 30, 600) == 45
+
+
+def test_compute_armed_interval_fast_near_and_after_reset():
+    assert ar.compute_armed_interval(10, 30, 600) == 30    # floored at confirm_fast
+    assert ar.compute_armed_interval(0, 30, 600) == 30
+    assert ar.compute_armed_interval(-5, 30, 600) == 30
+
+
+def test_compute_armed_interval_rate_limit_overrides():
+    # A live 429 backoff wins over the reset-distance cadence.
+    assert ar.compute_armed_interval(10, 30, 600, rl_wait=200) == 200
+
+
+def test_note_rate_limit_exponential_without_retry_after():
+    src = ar.UsageApiSource(_NS(), log=lambda m: None,
+                            client=FakeClient([SAMPLE_89_38]),
+                            monitor_check=lambda p: False)
+    assert src._note_rate_limit(None) == 60
+    assert src._note_rate_limit(None) == 120
+    assert src._note_rate_limit(None) == 240
+    # A successful poll (past the current backoff window) clears streak + window.
+    src.poll(now=src._rl_until + 1)
+    assert src._rl_streak == 0 and src._rl_until == 0.0
+
+
+def test_note_rate_limit_honors_retry_after_in_full():
+    src = ar.UsageApiSource(_NS(), log=lambda m: None,
+                            client=FakeClient([SAMPLE_89_38]),
+                            monitor_check=lambda p: False)
+    # Retry-After honored IN FULL (the old code capped the backoff at ~120s).
+    assert src._note_rate_limit(500) == 500
+    assert src._note_rate_limit(30) == 60          # floored at 60s
+
+
+def test_rate_limited_poll_suppresses_network_until_backoff_clears():
+    # A 429 sets a backoff window; polls inside it make NO network call, so a
+    # second poller (the Usage Monitor) sharing the token isn't piled on.
+    rl = usage_api.RateLimited(retry_after=60)
+    client = FakeClient([rl, SAMPLE_100])
+    src = ar.UsageApiSource(_NS(), log=lambda m: None,
+                            client=client, monitor_check=lambda p: False)
+    assert src.poll(now=1000.0) == []              # 429 -> backoff armed
+    assert client.calls == 1
+    assert src.poll(now=1000.0 + 30) == []         # inside window -> no fetch
+    assert client.calls == 1
+    hits = src.poll(now=src._rl_until + 1)          # window cleared -> fetch
+    assert client.calls == 2
+    assert len(hits) == 1 and hits[0]["kind"] == "session"
+
+
+def test_rearm_when_handled_but_reset_still_future(tmp_path, monkeypatch):
+    # A quota marked handled by a prior (premature) fire, but STILL blocked with
+    # its reset well in the FUTURE, must RE-ARM -- not stay dead as "already
+    # handled". This is the exact stuck-arm the owner hit (weekly 100%, resets
+    # tomorrow, but weekly|<epoch> already in handled -> auto never armed).
+    import json as _json
+    start = 1_900_000_000.0
+    reset = start + 500                             # > FUTURE_REARM_GRACE, future
+    key = ar.handled_key("session", reset)
+    args = _make_watch_args(tmp_path)
+    with open(args.state_file, "w", encoding="utf-8") as fh:
+        _json.dump({"handled": [key]}, fh)
+    src = FakeSource(reset_epoch=reset, confirm_seq=[False])
+    log, _ = _run_bounded(args, src, monkeypatch, start, max_sleeps=5)
+    assert "RE-ARM" in log, log
+    assert "ARM session" in log, log
+    assert "SKIP already handled" not in log, log
+
+
+def test_no_rearm_when_reset_already_past(tmp_path, monkeypatch):
+    # A handled quota whose reset is in the PAST stays SKIPped (dedup intact).
+    import json as _json
+    start = 1_900_000_000.0
+    reset = start - 10                              # past
+    key = ar.handled_key("session", reset)
+    args = _make_watch_args(tmp_path)
+    with open(args.state_file, "w", encoding="utf-8") as fh:
+        _json.dump({"handled": [key]}, fh)
+    src = FakeSource(reset_epoch=reset, confirm_seq=[False])
+    log, _ = _run_bounded(args, src, monkeypatch, start, max_sleeps=5)
+    assert "SKIP already handled" in log, log
+    assert "RE-ARM" not in log, log

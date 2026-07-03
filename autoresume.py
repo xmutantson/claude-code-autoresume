@@ -13,12 +13,17 @@ PRIMARY detection (self-sufficient): poll the authoritative usage endpoint
 (the same source the Usage Monitor for Claude uses; approach adapted from
 jens-duttke/usage-monitor-for-claude, MIT). A quota is blocked when its
 percent/utilization is >= 100; the resets_at timestamp gives the exact reset.
-autoresume polls the endpoint DIRECTLY on a FAST fixed cadence (~30s, see
---poll-interval) -- it does NOT depend on the Usage Monitor app and no longer
-backs off when the monitor is running. Polling itself, fast and continuously, is
-what closes the "a limit was HIT and RESET inside one long blind poll gap, so the
-reset was missed and dead work never resumed" hole. All credential + network code
-is isolated in usage_api.py; the OAuth token is never logged. See --source.
+autoresume polls the endpoint DIRECTLY (it does NOT depend on the Usage Monitor
+app) on an ADAPTIVE cadence so it doesn't trip the endpoint's PER-OAUTH-TOKEN
+rate limit -- the token is shared with the Usage Monitor, and two fast pollers on
+one token tripped HTTP 429 for both. IDLE it polls slowly (~180s, --poll-interval)
+just to catch a fresh hit; once ARMED (a hit observed, resets_at known) it SLEEPS
+to near the known reset -- the account is definitely still blocked until then --
+then polls fast to catch the exact clear (~10-50x fewer requests than a fixed
+fast cadence, same reliability). On HTTP 429 it honors Retry-After in full with an
+exponential backoff, and the backoff window suppresses BOTH the idle and armed
+polls so it never piles onto a rate-limited endpoint. All credential + network
+code is isolated in usage_api.py; the OAuth token is never logged. See --source.
 
 ARM-ON-HIT / FIRE-ON-RESET state machine: the watcher polls continuously. When a
 focused limit window is OBSERVED at utilization >= 100% (a real HIT) it ARMS and
@@ -57,7 +62,18 @@ No external Python packages are required beyond the standard library plus
 
 from __future__ import annotations
 
-__version__ = "0.4.0"   # 0.4.0: URI injector (DEFAULT) -- target the EXACT Claude
+__version__ = "0.5.0"   # 0.5.0: fix the shared-token HTTP 429 + a stuck-arm bug.
+                        #        ADAPTIVE polling: idle ~180s; while ARMED sleep to
+                        #        near the known reset then poll fast (~10-50x fewer
+                        #        requests). Real 429 backoff: honor Retry-After in
+                        #        FULL + exponential ramp (was capped at 120s), and
+                        #        a live backoff suppresses BOTH idle + armed polls.
+                        #        RE-ARM a still-blocked, future-reset quota even if
+                        #        it was marked handled (a prior inject-now/premature
+                        #        fire before the actual reset no longer disarms auto
+                        #        for that reset). Manual resume time now shows a
+                        #        COUNTDOWN in the GUI, not just a status line;
+                        # 0.4.0: URI injector (DEFAULT) -- target the EXACT Claude
                         #        Code session tab by id via the
                         #        vscode://anthropic.claude-code/open?session=<ID>
                         #        &prompt=<URLENCODED> deep link (focuses that tab +
@@ -156,14 +172,29 @@ STALE_RESET_GRACE = 6 * 3600 # if a reset already passed by more than this, trea
                              # the entry as historical and do NOT inject.
 
 # --- usage-API detection cadence (seconds) --------------------------------- #
-# FAST DIRECT POLLING. We poll the usage endpoint OURSELVES on this cadence,
-# always, regardless of whether the Usage Monitor app is running. The old
-# monitor-aware 900s courtesy backoff is GONE: a ~15-min blind gap could let a
-# limit be hit AND reset inside one gap, so the reset was missed and dead work
-# never resumed. A short fixed cadence closes that hole; the arm-on-hit /
-# fire-on-clear machine (below) then catches the reset within one poll.
-USAGE_POLL_INTERVAL = 30     # DIRECT usage-endpoint poll cadence (seconds).
-                             # Override with --poll-interval.
+# ADAPTIVE POLLING. The usage endpoint rate-limits PER OAUTH TOKEN, and the token
+# is shared with the Usage Monitor app -- so a fixed fast cadence (the old 30s)
+# stacked on the monitor's polling tripped HTTP 429 for BOTH tools. We now poll
+# lightly:
+#   * IDLE (hunting for a hit): every IDLE_POLL_INTERVAL. A hit is caught within
+#     one idle poll, then armed.
+#   * ARMED (a hit observed, resets_at known): we do NOT keep polling the whole
+#     way to the reset -- the account is definitely still blocked until then. We
+#     SLEEP until near the known reset (a slow ARMED_DRIFT_RECHECK safety check in
+#     case resets_at moved / cleared early), then poll fast (min(idle,
+#     USAGE_POLL_INTERVAL)) to catch the exact clear. ~10-50x fewer requests than
+#     the old fixed 30s, same reliability.
+# The arm-on-hit / fire-on-clear machine (below) still catches the reset within
+# one (now near-reset, fast) poll.
+IDLE_POLL_INTERVAL = 180     # idle usage-endpoint poll cadence (s); --poll-interval.
+USAGE_POLL_INTERVAL = 30     # FAST-confirm cap near/after the reset (also the
+                             # legacy --usage-poll default). While armed we never
+                             # confirm faster than this.
+ARMED_DRIFT_RECHECK = 600    # while ARMED but far from the reset, re-confirm at
+                             # most this often (safety net for a moved/early reset)
+RL_BACKOFF_CAP = 900         # max seconds to back off after repeated HTTP 429s
+FUTURE_REARM_GRACE = 120     # re-arm a "handled" quota only if its reset is still
+                             # at least this many seconds in the FUTURE
 MONITOR_POLL_INTERVAL = 900  # DEPRECATED / ignored -- kept only so an existing
                              # --monitor-poll argument still parses. Cadence no
                              # longer backs off for the monitor.
@@ -1404,15 +1435,29 @@ class TranscriptSource:
         return args.poll
 
 
+def compute_armed_interval(remaining, confirm_fast, drift_recheck, rl_wait=0.0):
+    """Adaptive confirm-re-poll cadence while ARMED, given the seconds `remaining`
+    until fire_at. A live 429 backoff (`rl_wait`>0) overrides everything. Far from
+    the reset the account is definitely still blocked, so we barely poll (a slow
+    `drift_recheck` in case resets_at moved or cleared early); as fire_at nears the
+    interval shrinks so the next confirm lands ~at the reset; at/after the reset we
+    poll fast (`confirm_fast`) to catch the exact clear. This is the single source
+    of truth for the cadence (used by UsageApiSource and the run_watch fallback)."""
+    if rl_wait and rl_wait > 0:
+        return float(rl_wait)
+    if remaining > 0:
+        return max(float(confirm_fast), min(float(remaining), float(drift_recheck)))
+    return float(confirm_fast)
+
+
 class UsageApiSource:
     """PRIMARY source: poll GET /api/oauth/usage and arm on percent >= 100.
 
-    Polls the endpoint on a FAST FIXED cadence (self.normal, default ~30s), ALWAYS
-    -- it no longer backs off when the Usage Monitor app is running (that 15-min
-    backoff let a hit+reset slip through one blind gap). While the watch loop is
-    ARMED it also calls confirm_reset() every tick to detect the reset the instant
-    the window CLEARS. The Usage Monitor's presence is now only logged for
-    information; it never changes our cadence."""
+    Polls the endpoint on an ADAPTIVE cadence: IDLE at self.normal (default ~180s)
+    while hunting a hit, and while ARMED it sleeps to near the known reset then
+    polls fast (see armed_confirm_interval / compute_armed_interval) so the
+    shared-token endpoint isn't hammered into a 429. The Usage Monitor's presence
+    is only logged for information; it never changes our cadence."""
 
     def __init__(self, args, log, client=None, monitor_check=None):
         self.args = args
@@ -1421,9 +1466,16 @@ class UsageApiSource:
             cred_path=getattr(args, "cred_path", None)
         )
         self._monitor_check = monitor_check or usage_monitor_running
+        # IDLE hunt cadence (how often we poll while looking for a hit).
         self.normal = (getattr(args, "poll_interval", None)
                        or getattr(args, "usage_poll", None)
-                       or USAGE_POLL_INTERVAL)
+                       or IDLE_POLL_INTERVAL)
+        # FAST-confirm cadence used near/after the reset while armed -- never
+        # slower than the idle cadence, capped at USAGE_POLL_INTERVAL so we catch
+        # the exact clear even when idle polling is deliberately slow.
+        self.confirm_fast = max(1.0, min(float(self.normal), float(USAGE_POLL_INTERVAL)))
+        self.drift_recheck = float(getattr(args, "armed_drift_recheck",
+                                           ARMED_DRIFT_RECHECK))
         # Retained for API/test compatibility; no longer used to back off cadence.
         self.backoff = self.normal
         self.confirm_below = getattr(args, "confirm_below", CONFIRM_BELOW)
@@ -1434,6 +1486,8 @@ class UsageApiSource:
         self._monitor_cache = (0.0, False)   # (checked_at, running)
         self._monitor_logged = None          # last-logged monitor state (dedup)
         self._auth_update_done = False
+        self._rl_streak = 0                  # consecutive HTTP 429s (backoff ramp)
+        self._rl_until = 0.0                 # epoch: no network before this (429)
 
     def label(self):
         return "usage-api"
@@ -1492,10 +1546,11 @@ class UsageApiSource:
                     self.log(f"usage-api: could not launch 'claude update' ({e!r})")
             return None
         except usage_api.RateLimited as e:
-            ra = e.retry_after if e.retry_after else 60.0
-            self._interval = max(30.0, min(ra, float(self.backoff)))
+            backoff = self._note_rate_limit(e.retry_after)
+            self._interval = backoff
             self.log(f"usage-api: HTTP 429 rate_limited; backing off "
-                     f"{int(self._interval)}s (Retry-After={e.retry_after})")
+                     f"{int(backoff)}s (Retry-After={e.retry_after}, "
+                     f"streak={self._rl_streak})")
             return None
         except usage_api.ServerError as e:
             self._interval = min(float(self.normal), 60.0)
@@ -1512,30 +1567,60 @@ class UsageApiSource:
             return None
         return usage
 
+    def _note_rate_limit(self, retry_after):
+        """Record an HTTP 429 and return the seconds to back off. Honors a
+        Retry-After header in full; otherwise ramps 60,120,240,... capped at
+        RL_BACKOFF_CAP. The backoff window (self._rl_until) is respected by BOTH
+        the idle poll and the armed confirm re-poll so neither hammers the
+        rate-limited endpoint."""
+        self._rl_streak += 1
+        if retry_after:
+            backoff = max(float(retry_after), 60.0)
+        else:
+            backoff = min(60.0 * (2 ** (self._rl_streak - 1)), float(RL_BACKOFF_CAP))
+        self._rl_until = time.time() + backoff
+        return backoff
+
     def poll(self, now=None):
         now = time.time() if now is None else now
+        if now < self._rl_until:
+            return []                       # still backing off from an HTTP 429
         if self._last_fetch and (now - self._last_fetch) < self._interval:
             return []                       # respect our own polling cadence
         self._last_fetch = now
         usage = self._fetch()
         if usage is None:
             return []                       # error path already set the backoff
-        # Success: next fetch is due after our fixed fast cadence. The Usage
-        # Monitor's presence is only logged, never used to slow us down.
+        # Success: clear any 429 backoff and poll again after the idle cadence.
+        # The Usage Monitor's presence is only logged, never used to slow us down.
+        self._rl_streak = 0
+        self._rl_until = 0.0
         self._log_monitor_state(now)
         self._interval = float(self.normal)
         blocked = usage_api.find_blocked_quotas(usage)
         return [self._to_hit(q) for q in blocked]
+
+    def armed_confirm_interval(self, remaining):
+        """Adaptive network cadence while ARMED (fed the seconds until fire_at).
+        A live 429 backoff overrides; otherwise see compute_armed_interval."""
+        rl_wait = max(0.0, self._rl_until - time.time())
+        return compute_armed_interval(remaining, self.confirm_fast,
+                                      self.drift_recheck, rl_wait)
 
     def confirm_reset(self, pending, log):
         """RE-POLL at fire time: is the pending quota actually reset yet?"""
         meta = pending.get("meta") or {"label": pending.get("kind")}
         try:
             usage = self.client.fetch()
-        except usage_api.RateLimited:
-            return False, "HTTP 429 at confirm (still rate-limited); waiting"
+        except usage_api.RateLimited as e:
+            backoff = self._note_rate_limit(e.retry_after)
+            return False, (f"HTTP 429 at confirm (Retry-After={e.retry_after}); "
+                           f"backing off {int(backoff)}s")
         except usage_api.UsageAPIError as e:
             return False, f"confirm fetch failed ({e}); waiting"
+        # A successful confirm fetch clears any 429 backoff too.
+        self._rl_streak = 0
+        self._rl_until = 0.0
         if usage_api.is_quota_reset(usage, meta, below=self.confirm_below):
             return True, f"utilization dropped below {self.confirm_below:g}%"
         return False, (f"utilization still >= {self.confirm_below:g}%; "
@@ -1624,13 +1709,20 @@ def run_watch(args, shared=None, source=None):
 
     src = source if source is not None else select_source(args, log)
     manual_file = getattr(args, "manual_file", MANUAL_FILE)
-    # Fast fixed poll cadence, used both for idle hit-polling and, while ARMED,
-    # for the fire-on-clear confirm re-poll (loop tick stays short for GUI /
-    # kill-switch responsiveness; the NETWORK cadence is this).
+    # While ARMED, the fire-on-clear confirm re-poll cadence is ADAPTIVE: the
+    # source sleeps to near the known reset then polls fast (see
+    # UsageApiSource.armed_confirm_interval). armed_poll is only the fixed
+    # fallback for sources that don't implement the adaptive method (transcript).
     armed_poll = max(1, int(getattr(args, "usage_poll", None) or USAGE_POLL_INTERVAL))
+    armed_interval = getattr(src, "armed_confirm_interval", None)
+    # Fallback adaptive-cadence knobs for sources without armed_confirm_interval
+    # (e.g. the transcript source / test doubles): fast near the reset, a slow
+    # drift re-check far from it -- same shape as the usage-API source.
+    _confirm_fast_fb = max(1.0, min(float(armed_poll), float(USAGE_POLL_INTERVAL)))
+    _drift_fb = float(getattr(args, "armed_drift_recheck", ARMED_DRIFT_RECHECK))
     log(f"START autoresume v{__version__} source={src.label()} "
-        f"buffer={args.buffer}s poll={armed_poll}s injector={args.injector} "
-        f"dry_run={args.dry_run}")
+        f"buffer={args.buffer}s idle_poll={getattr(src, 'normal', armed_poll)}s "
+        f"injector={args.injector} dry_run={args.dry_run}")
     stop_path = args.stop_file
     if stop_path and os.path.exists(stop_path):
         log(f"NOTE kill switch present at {stop_path}; injection disabled until removed")
@@ -1752,6 +1844,16 @@ def run_watch(args, shared=None, source=None):
 
         now = time.time()
 
+        # Show a COUNTDOWN to a pending manual resume time so a set manual time is
+        # visibly armed in the GUI (a timer), not just a status line. An auto arm,
+        # if present, owns the countdown (its fire_at is the real reset+buffer); a
+        # manual time only drives the display when nothing is auto-armed.
+        if manual is not None and pending is None:
+            m_at = float(manual["resume_at"])
+            if now < m_at:
+                publish(state="PENDING", kind="manual",
+                        reset_str=_fmt_local(m_at), reset_epoch=m_at, fire_at=m_at)
+
         # ---- MANUAL FIRE: fire at the owner-set time regardless of detection -- #
         if manual is not None:
             m_fire = float(manual["resume_at"])
@@ -1814,10 +1916,30 @@ def run_watch(args, shared=None, source=None):
                 local_str = datetime.fromtimestamp(reset_epoch).isoformat(timespec="seconds")
                 log(f"DETECT {kind} limit; reset_reported={reset_str!r} "
                     f"resolved_local={local_str} key={key}")
-                if is_handled(state, key):
-                    log(f"SKIP already handled {key} (dedup, once per reset)")
-                    continue
                 now = time.time()
+                if is_handled(state, key):
+                    # Normally once-per-reset dedup. BUT this hit means the quota
+                    # is CURRENTLY blocked (>=100%). If its reset is still well in
+                    # the FUTURE, a prior fire marked it handled before the reset
+                    # actually happened (e.g. inject-now while still limited, or a
+                    # premature confirm) -> the account is STILL limited and WILL
+                    # reset at this epoch. Clear the stale mark and re-arm so the
+                    # real reset still resumes; don't leave it dead. A legitimate
+                    # post-reset fire drops utilization <100 so the quota isn't
+                    # reported here at all -> no double-fire after a real reset.
+                    if reset_epoch > now + FUTURE_REARM_GRACE:
+                        log(f"RE-ARM {key}: was marked handled but the quota is "
+                            f"still blocked and its reset is "
+                            f"{int(reset_epoch - now)}s in the FUTURE "
+                            f"(prior fire before the actual reset); clearing the "
+                            f"stale handled mark and re-arming")
+                        state["handled"] = [h for h in state.get("handled", [])
+                                            if h != key]
+                        save_state(state, args.state_file)
+                        # fall through to the stale check + arm below
+                    else:
+                        log(f"SKIP already handled {key} (dedup, once per reset)")
+                        continue
                 if reset_epoch < now - args.stale_grace:
                     log(f"SKIP stale reset {key} (already passed > "
                         f"{args.stale_grace}s ago; historical entry)")
@@ -1875,12 +1997,18 @@ def run_watch(args, shared=None, source=None):
             now = time.time()
             fire = False
             reason = ""
-            # FIRE-ON-CLEAR: while armed we re-poll on the fast cadence and fire
-            # the instant the source reports the window cleared (utilization back
-            # below the block line). This catches an early / exact reset and a
-            # reset that landed while we were restarting -- not just reset+buffer.
+            # FIRE-ON-CLEAR: while armed we re-poll and fire the instant the
+            # source reports the window cleared (utilization back below the block
+            # line). This catches an early / exact reset and a reset that landed
+            # while we were restarting -- not just reset+buffer. The cadence is
+            # ADAPTIVE (sleep to near the known reset, then poll fast) so we don't
+            # hammer the shared-token endpoint into a 429 for the whole arm.
+            remaining = float(pending["fire_at"]) - now
+            confirm_iv = (armed_interval(remaining) if armed_interval is not None
+                          else compute_armed_interval(remaining, _confirm_fast_fb,
+                                                       _drift_fb))
             confirm_due = (force_now or last_armed_confirm == 0.0
-                           or (now - last_armed_confirm) >= armed_poll)
+                           or (now - last_armed_confirm) >= confirm_iv)
             if force_now:
                 fire, reason = True, "inject-now"
             elif confirm_due:
@@ -1894,7 +2022,7 @@ def run_watch(args, shared=None, source=None):
                     # reset yet -> never resume into a still-blocked account; wait.
                     if not confirm_wait_logged:
                         log(f"WAIT {pending['key']}: reset not applied yet "
-                            f"({detail}); re-checking every {armed_poll}s")
+                            f"({detail}); re-checking every {int(confirm_iv)}s")
                         confirm_wait_logged = True
                     publish(state="PENDING",
                             last_action=f"reset not applied yet ({detail})")
@@ -2528,10 +2656,17 @@ def build_argparser():
                         "/api/oauth/usage (primary); transcript=legacy JSONL "
                         "watcher (fallback)")
     w.add_argument("--poll-interval", "--usage-poll", dest="usage_poll", type=int,
-                   default=USAGE_POLL_INTERVAL,
-                   help="DIRECT usage-endpoint poll cadence in seconds (default "
-                        f"{USAGE_POLL_INTERVAL}). Also the fire-on-clear re-poll "
-                        "cadence while armed. (--usage-poll is a legacy alias.)")
+                   default=IDLE_POLL_INTERVAL,
+                   help="IDLE usage-endpoint poll cadence in seconds (default "
+                        f"{IDLE_POLL_INTERVAL}). While ARMED the confirm re-poll "
+                        "is ADAPTIVE (sleep to near the known reset, then poll "
+                        f"fast, capped at {USAGE_POLL_INTERVAL}s) so the "
+                        "shared-token endpoint isn't hammered into a 429. "
+                        "(--usage-poll is a legacy alias.)")
+    w.add_argument("--armed-drift-recheck", type=int, default=ARMED_DRIFT_RECHECK,
+                   help="while ARMED but far from the reset, re-confirm at most "
+                        f"this often in seconds (default {ARMED_DRIFT_RECHECK}; "
+                        "safety net for a resets_at that moved or cleared early)")
     w.add_argument("--monitor-poll", type=int, default=MONITOR_POLL_INTERVAL,
                    help="DEPRECATED / ignored -- autoresume no longer backs off "
                         "for the Usage Monitor; it always polls at --poll-interval")
