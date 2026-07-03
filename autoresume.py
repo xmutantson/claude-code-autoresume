@@ -57,7 +57,9 @@ No external Python packages are required beyond the standard library plus
 
 from __future__ import annotations
 
-__version__ = "0.3.1"   # 0.3.1: fix Inject-now button doing nothing in plain
+__version__ = "0.3.2"   # 0.3.2: stop un-fullscreening VSCode on inject (only
+                        #        un-minimize, never SW_RESTORE a maximized window);
+                        # 0.3.1: fix Inject-now button doing nothing in plain
                         #        watching mode (fire a manual inject with no pending);
                         # 0.3.0: fast direct polling (no monitor backoff),
                         #        arm-on-hit/fire-on-clear state machine (persisted
@@ -402,6 +404,8 @@ user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintyp
 user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
 user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
 user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+user32.IsIconic.argtypes = (wintypes.HWND,)
+user32.IsIconic.restype = wintypes.BOOL
 kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
 kernel32.OpenProcess.restype = wintypes.HANDLE
 kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
@@ -689,7 +693,11 @@ def activate_window(hwnd) -> None:
     if fg_tid.value and fg_tid.value != cur_tid:
         attached = bool(user32.AttachThreadInput(cur_tid, fg_tid.value, True))
 
-    user32.ShowWindow(hwnd, SW_RESTORE)
+    # Only un-MINIMIZE; never SW_RESTORE a maximized/fullscreen window -- that
+    # would un-fullscreen VSCode (the owner's complaint). BringWindowToTop +
+    # SetForegroundWindow bring it forward without changing the maximize state.
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
     user32.BringWindowToTop(hwnd)
     user32.SetForegroundWindow(hwnd)
 
