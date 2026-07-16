@@ -491,3 +491,62 @@ def test_no_rearm_when_reset_already_past(tmp_path, monkeypatch):
     log, _ = _run_bounded(args, src, monkeypatch, start, max_sleeps=5)
     assert "SKIP already handled" in log, log
     assert "RE-ARM" not in log, log
+
+
+# --------------------------------------------------------------------------- #
+# (g) EARLY / unexpected reset -> flag it + state the next weekly reset        #
+# --------------------------------------------------------------------------- #
+
+def test_early_reset_flags_unexpected_and_weekly(tmp_path, monkeypatch):
+    # The quota CLEARS before its reported reset time -> resume now, and the
+    # injected message must say UNEXPECTEDLY EARLY and state the next weekly reset.
+    from datetime import datetime, timezone
+    start = 1_900_000_000.0
+    # reported reset is 1h out, but confirm returns True immediately -> early.
+    src = FakeSource(reset_epoch=start + 3600, confirm_seq=[True])
+    wk = datetime.fromtimestamp(start + 6 * 86400 + 4 * 3600, tz=timezone.utc)
+    src.next_weekly_reset = lambda: (wk, "raw")   # usage-API-only capability
+    args = _make_watch_args(tmp_path)
+    log, _ = _run_bounded(args, src, monkeypatch, start, max_sleeps=60)
+    assert log.count("DRY-RUN would inject") == 1, log
+    assert "EARLY RESET" in log, log                 # the diagnostic log line
+    assert "[EARLY]" in log, log                     # the FIRE line tag
+    assert "UNEXPECTEDLY EARLY" in log, log          # the injected-message wording
+    assert "weekly usage limit next resets at" in log, log
+    assert "in 6d" in log, log                       # format_duration_approx
+
+
+def test_ontime_reset_not_flagged_early(tmp_path, monkeypatch):
+    # A reset at/after its reported time is NOT flagged early (normal wording).
+    start = 1_900_000_000.0
+    src = FakeSource(reset_epoch=start - 60, confirm_seq=[True])  # reset already due
+    args = _make_watch_args(tmp_path)
+    log, _ = _run_bounded(args, src, monkeypatch, start, max_sleeps=60)
+    assert log.count("DRY-RUN would inject") == 1, log
+    assert "UNEXPECTEDLY EARLY" not in log, log
+    assert "EARLY RESET" not in log, log
+    assert "has now reset (reset reported" in log, log   # normal template
+
+
+def test_weekly_reset_helper():
+    # usage_api.weekly_reset picks the aggregate weekly quota's next reset.
+    usage = {
+        "limits": [
+            {"kind": "session", "group": "session", "percent": 10,
+             "resets_at": "2026-07-15T20:00:00+00:00"},
+            {"kind": "weekly_opus", "group": "weekly", "percent": 50,
+             "resets_at": "2026-07-20T08:00:00+00:00"},
+            {"kind": "weekly_all", "group": "weekly", "percent": 38,
+             "resets_at": "2026-07-22T08:00:00+00:00"},
+        ],
+        "seven_day": {"utilization": 38.0,
+                      "resets_at": "2026-07-22T08:00:00+00:00"},
+    }
+    dt, raw = usage_api.weekly_reset(usage)
+    assert dt is not None and raw == "2026-07-22T08:00:00+00:00", (dt, raw)
+    # falls back to seven_day when limits[] has no weekly entry
+    dt2, _ = usage_api.weekly_reset({"seven_day":
+                                     {"resets_at": "2026-07-22T08:00:00+00:00"}})
+    assert dt2 is not None
+    # nothing weekly -> (None, None)
+    assert usage_api.weekly_reset({"limits": []}) == (None, None)

@@ -62,7 +62,16 @@ No external Python packages are required beyond the standard library plus
 
 from __future__ import annotations
 
-__version__ = "0.5.1"   # 0.5.1: stop the periodic console-window FLASH on Windows
+__version__ = "0.6.0"   # 0.6.0: RESUME EARLY on an UNEXPECTED reset + tell the
+                        #        agent. The armed fire-on-clear already fires the
+                        #        instant a quota clears (even before its reported
+                        #        reset); now, when it clears BEFORE that reported
+                        #        time, the injected message says the limit reset
+                        #        UNEXPECTEDLY EARLY and states how long until the
+                        #        WEEKLY limit resets again (usage_api.weekly_reset)
+                        #        so the resumed agent can budget its work. A
+                        #        matching "EARLY RESET ... resuming now" log line;
+                        # 0.5.1: stop the periodic console-window FLASH on Windows
                         #        — every shell-out (tasklist monitor-check on a ~60s
                         #        timer, claude --version, cscript, AHK) now passes
                         #        CREATE_NO_WINDOW so no console window pops under
@@ -1231,10 +1240,25 @@ def restore_arm(state: dict, now=None):
 
 RESUME_TEMPLATE = (
     "[AUTOMATED RESUME] A {kind} usage limit was hit and has now reset "
-    "(reset reported: {reset_str}). This is an automated message; the user is "
-    "away and will NOT see or respond to your output. Continue the autonomous "
-    "work from where you left off: consult _research/AUTONOMOUS_WORKLOG.md and "
-    "the current todo list, and keep going. Do not wait for user input."
+    "(reset reported: {reset_str}).{weekly_clause} This is an automated message; "
+    "the user is away and will NOT see or respond to your output. Continue the "
+    "autonomous work from where you left off: consult "
+    "_research/AUTONOMOUS_WORKLOG.md and the current todo list, and keep going. "
+    "Do not wait for user input."
+)
+
+# EARLY reset: the armed quota's utilization dropped below the block line BEFORE
+# its reported reset time -- i.e. usage came back EARLIER than the API said it
+# would (the server applied the reset ahead of schedule). The agent should know
+# it was unexpected so it doesn't trust the previously-reported reset time.
+EARLY_RESUME_TEMPLATE = (
+    "[AUTOMATED RESUME] A {kind} usage limit was hit and has now reset "
+    "UNEXPECTEDLY EARLY -- it was reported to reset at {reset_str}, but the quota "
+    "cleared ahead of that, so you have usage again NOW.{weekly_clause} This is an "
+    "automated message; the user is away and will NOT see or respond to your "
+    "output. Continue the autonomous work from where you left off: consult "
+    "_research/AUTONOMOUS_WORKLOG.md and the current todo list, and keep going. "
+    "Do not wait for user input."
 )
 
 # Manual mode: the owner scheduled this resume time explicitly (GUI / --resume-at)
@@ -1248,12 +1272,43 @@ MANUAL_RESUME_TEMPLATE = (
 )
 
 
-def build_message(kind: str, reset_str: str) -> str:
+def _weekly_clause(weekly_reset_str, weekly_remaining) -> str:
+    """The ' The weekly usage limit next resets ...' sentence for the resume
+    message, or '' when no weekly reset is known. Leads with a space so it drops
+    straight into the templates' ``{weekly_clause}`` slot. ASCII only."""
+    if not weekly_reset_str:
+        return ""
+    tail = f" (in {weekly_remaining})" if weekly_remaining else ""
+    return (f" The weekly usage limit next resets at {weekly_reset_str}{tail}, so "
+            f"budget your work to that window.")
+
+
+def build_message(kind: str, reset_str: str, early: bool = False,
+                  weekly_reset_str=None, weekly_remaining=None) -> str:
     # kind reaching here is session|weekly (auto) or "manual" (scheduled time).
-    # monthly-spend never injects.
+    # monthly-spend never injects. `early` picks the UNEXPECTEDLY-EARLY wording;
+    # weekly_reset_str/_remaining add the "weekly next resets at ..." budget line.
     if kind == "manual":
         return MANUAL_RESUME_TEMPLATE.format(reset_str=reset_str)
-    return RESUME_TEMPLATE.format(kind=kind, reset_str=reset_str)
+    weekly_clause = _weekly_clause(weekly_reset_str, weekly_remaining)
+    tmpl = EARLY_RESUME_TEMPLATE if early else RESUME_TEMPLATE
+    return tmpl.format(kind=kind, reset_str=reset_str, weekly_clause=weekly_clause)
+
+
+def format_duration_approx(seconds) -> str:
+    """Compact human duration for the resume message: '6d 4h', '3h 12m', '45m',
+    '30s'. Clamps negatives to '0s'. Pure (no IO); unit-tested headlessly."""
+    s = int(max(0, round(float(seconds))))
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m, sec = divmod(rem, 60)
+    if d:
+        return f"{d}d {h}h" if h else f"{d}d"
+    if h:
+        return f"{h}h {m}m" if m else f"{h}h"
+    if m:
+        return f"{m}m"
+    return f"{sec}s"
 
 
 # --------------------------------------------------------------------------- #
@@ -1500,6 +1555,7 @@ class UsageApiSource:
         self._auth_update_done = False
         self._rl_streak = 0                  # consecutive HTTP 429s (backoff ramp)
         self._rl_until = 0.0                 # epoch: no network before this (429)
+        self._last_usage = None              # last successful fetch (for weekly reset)
 
     def label(self):
         return "usage-api"
@@ -1609,6 +1665,7 @@ class UsageApiSource:
         self._rl_until = 0.0
         self._log_monitor_state(now)
         self._interval = float(self.normal)
+        self._last_usage = usage
         blocked = usage_api.find_blocked_quotas(usage)
         return [self._to_hit(q) for q in blocked]
 
@@ -1633,10 +1690,19 @@ class UsageApiSource:
         # A successful confirm fetch clears any 429 backoff too.
         self._rl_streak = 0
         self._rl_until = 0.0
+        self._last_usage = usage
         if usage_api.is_quota_reset(usage, meta, below=self.confirm_below):
             return True, f"utilization dropped below {self.confirm_below:g}%"
         return False, (f"utilization still >= {self.confirm_below:g}%; "
                        f"reset not applied yet")
+
+    def next_weekly_reset(self):
+        """``(datetime, raw_str)`` of the weekly quota's next reset from the last
+        successful fetch, or ``(None, None)``. Fed into the resume message so a
+        resumed agent knows how long until the weekly limit resets again."""
+        if not self._last_usage:
+            return None, None
+        return usage_api.weekly_reset(self._last_usage)
 
     def loop_tick(self, pending, now, args):
         # Stay responsive near a scheduled reset (so confirm retries + GUI feel
@@ -1792,9 +1858,25 @@ def run_watch(args, shared=None, source=None):
         d_sid, d_ws = derive_session_and_workspace(args.watch_dir, tpath, log=log)
         return (sid or d_sid), (ws or d_ws)
 
-    def do_inject(kind, reset_str):
+    def do_inject(kind, reset_str, early=False):
         nonlocal last_inject_time
-        message = build_message(kind, reset_str)
+        # Tell the resumed agent how long until the WEEKLY limit resets again
+        # (best-effort; only the usage-API source knows it). `early` flags an
+        # UNEXPECTEDLY-EARLY reset (the quota cleared before its reported time).
+        weekly_reset_str = weekly_remaining = None
+        get_weekly = getattr(src, "next_weekly_reset", None)
+        if get_weekly is not None:
+            try:
+                wk_dt, _wk_raw = get_weekly()
+            except Exception:  # noqa: BLE001 - weekly info is best-effort
+                wk_dt = None
+            if wk_dt is not None:
+                weekly_reset_str = _fmt_local(wk_dt.timestamp())
+                weekly_remaining = format_duration_approx(
+                    wk_dt.timestamp() - time.time())
+        message = build_message(kind, reset_str, early=early,
+                                weekly_reset_str=weekly_reset_str,
+                                weekly_remaining=weekly_remaining)
         injector = args.injector
         session_id = workspace_title = None
         if injector == "uri":
@@ -2009,6 +2091,7 @@ def run_watch(args, shared=None, source=None):
             now = time.time()
             fire = False
             reason = ""
+            early_reset = False   # the window cleared BEFORE its reported reset
             # FIRE-ON-CLEAR: while armed we re-poll and fire the instant the
             # source reports the window cleared (utilization back below the block
             # line). This catches an early / exact reset and a reset that landed
@@ -2029,6 +2112,15 @@ def run_watch(args, shared=None, source=None):
                 if confirmed:
                     fire, reason = True, f"window cleared ({detail})"
                     confirm_wait_logged = False
+                    # EARLY: the quota cleared BEFORE its reported reset time, so
+                    # usage came back ahead of schedule -- resume now and tell the
+                    # agent it was unexpected (don't trust the old reset time).
+                    re_epoch = pending.get("reset_epoch")
+                    if re_epoch is not None and now < float(re_epoch):
+                        early_reset = True
+                        log(f"EARLY RESET {pending['key']}: quota cleared "
+                            f"{int(float(re_epoch) - now)}s BEFORE its reported "
+                            f"reset ({detail}); resuming now")
                 elif now >= pending["fire_at"]:
                     # Reset time reached but the server has not applied its own
                     # reset yet -> never resume into a still-blocked account; wait.
@@ -2059,9 +2151,11 @@ def run_watch(args, shared=None, source=None):
                 else:
                     kill_logged = False
                     log(f"FIRE inject {key} (kind={pending['kind']}; {reason})"
-                        + (" [inject-now]" if force_now else ""))
+                        + (" [inject-now]" if force_now else "")
+                        + (" [EARLY]" if early_reset else ""))
                     publish(state="FIRING")
-                    ok = do_inject(pending["kind"], pending["reset_str"])
+                    ok = do_inject(pending["kind"], pending["reset_str"],
+                                   early=early_reset)
                     if ok:
                         mark_handled(state, key)
                         clear_arm(state, args.state_file)   # also saves state

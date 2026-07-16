@@ -401,6 +401,39 @@ def find_blocked_quotas(usage: dict, threshold: float = BLOCK_THRESHOLD):
     return out
 
 
+def weekly_reset(usage: dict):
+    """Return ``(datetime, raw_str)`` for the WEEKLY quota's NEXT reset, or
+    ``(None, None)`` if none is reported.
+
+    Prefers the aggregate ``weekly`` quota (weekly_all / seven_day); falls back
+    to the earliest weekly-scoped limit, then the top-level ``seven_day`` object.
+    The datetime is tz-aware UTC (``.timestamp()`` gives the machine-local epoch).
+    Used to tell a resumed agent how long until the weekly limit resets again --
+    independent of WHICH quota (session/weekly) just cleared."""
+    aggregate = None            # the plain "weekly" (weekly_all/seven_day)
+    scoped = None               # earliest of any weekly (Opus)/(scoped)/... limit
+    for lim in usage.get("limits") or []:
+        label = friendly_label(lim.get("kind"), lim.get("group"))
+        if not label.startswith("weekly"):
+            continue
+        ra = parse_resets_at(lim.get("resets_at"))
+        if ra is None:
+            continue
+        pair = (ra, lim.get("resets_at"))
+        if label == "weekly":
+            aggregate = pair
+        elif scoped is None or ra < scoped[0]:
+            scoped = pair
+    if aggregate is not None:
+        return aggregate
+    obj = usage.get("seven_day")
+    if isinstance(obj, dict):
+        ra = parse_resets_at(obj.get("resets_at"))
+        if ra is not None:
+            return ra, obj.get("resets_at")
+    return scoped if scoped is not None else (None, None)
+
+
 def is_quota_reset(usage: dict, quota: dict, below: float = RESET_CONFIRM_BELOW) -> bool:
     """True iff the given quota has been RESET in a freshly-fetched `usage`.
 

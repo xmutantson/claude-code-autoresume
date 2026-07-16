@@ -93,6 +93,15 @@ poll /api/oauth/usage every ~30s ─▶ blocked? (percent ≥ 100) ─▶ ARM + 
    ≥ 100 %, it waits and re-checks. Crucially it fires **only if a hit was
    observed** (armed): a window at 0 % with no prior hit **never** fires.
 
+   **Early / unexpected reset (v0.6.0).** Because it fires on the *clear*, a quota
+   that resets **earlier than its reported `resets_at`** (the server applying the
+   reset ahead of schedule) resumes as soon as the next poll sees it cleared —
+   without waiting for the stale reset time. When that happens the injected
+   message tells the agent the limit reset **UNEXPECTEDLY EARLY** (so it doesn't
+   trust the old reported time) and states **how long until the *weekly* limit
+   resets again** (`usage_api.weekly_reset`), so an autonomous agent can budget its
+   work to that window. A matching `EARLY RESET … resuming now` line is logged.
+
 5. **Dedup + inject.** Each reset collapses to a `(KIND, reset-minute)` key; a
    persisted watermark (`state.json`) ensures **exactly one** injection per reset,
    even across restarts. To inject it picks the target window (**foreground-first**,

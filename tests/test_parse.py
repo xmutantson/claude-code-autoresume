@@ -25,6 +25,7 @@ from autoresume import (  # noqa: E402
     resolve_reset_epoch,
     handled_key,
     build_message,
+    format_duration_approx,
 )
 
 try:
@@ -156,6 +157,42 @@ def main():
     check("Do not wait for user input." in msg, "tells agent not to wait")
     check("\n" not in msg, "single line (no embedded newline)")
     check(all(ord(c) < 128 for c in msg), "pure ASCII (safe to type)")
+    check("UNEXPECTEDLY EARLY" not in msg, "normal reset is NOT flagged early")
+    check("weekly usage limit next resets" not in msg,
+          "no weekly clause when none supplied")
+
+    print("\n[11] EARLY / unexpected reset message + weekly budget clause")
+    emsg = build_message(
+        "weekly", "Jul 17, 1am (America/Los_Angeles)", early=True,
+        weekly_reset_str="Jul 22 01:00", weekly_remaining="6d 4h")
+    check(emsg.startswith("[AUTOMATED RESUME]"), "starts with [AUTOMATED RESUME]")
+    check("UNEXPECTEDLY EARLY" in emsg, "flags the reset as unexpectedly early")
+    check("Jul 17, 1am (America/Los_Angeles)" in emsg,
+          "still names the originally-reported reset time")
+    check("weekly usage limit next resets at Jul 22 01:00" in emsg,
+          "states the NEXT weekly reset time")
+    check("6d 4h" in emsg, "states how long until the weekly resets again")
+    check("budget your work" in emsg, "tells the agent to budget to the window")
+    check("Do not wait for user input." in emsg, "still tells agent not to wait")
+    check("\n" not in emsg, "single line (no embedded newline)")
+    check(all(ord(c) < 128 for c in emsg), "pure ASCII (safe to type)")
+    # early flag without weekly info: still early-worded, no dangling clause.
+    emsg2 = build_message("session", "3pm (America/Los_Angeles)", early=True)
+    check("UNEXPECTEDLY EARLY" in emsg2 and "weekly usage limit next resets"
+          not in emsg2, "early wording works without weekly info")
+    # manual template ignores early/weekly (owner-scheduled, not detected).
+    mmsg = build_message("manual", "Jul 15 20:59", early=True,
+                         weekly_reset_str="X", weekly_remaining="1d")
+    check("manually scheduled resume time" in mmsg and "UNEXPECTEDLY EARLY"
+          not in mmsg, "manual message unaffected by early/weekly")
+
+    print("\n[12] format_duration_approx")
+    check(format_duration_approx(6 * 86400 + 4 * 3600) == "6d 4h", "days+hours")
+    check(format_duration_approx(2 * 86400) == "2d", "whole days")
+    check(format_duration_approx(3 * 3600 + 12 * 60) == "3h 12m", "hours+minutes")
+    check(format_duration_approx(45 * 60) == "45m", "minutes")
+    check(format_duration_approx(30) == "30s", "seconds")
+    check(format_duration_approx(-5) == "0s", "negative clamps to 0s")
 
     print(f"\n==== {_passed} passed, {_failed} failed ====")
     return 1 if _failed else 0
