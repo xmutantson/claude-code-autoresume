@@ -127,7 +127,7 @@ def _run_bounded(args, source, monkeypatch, start, max_sleeps=400):
     clock = FakeClock(start, max_sleeps=max_sleeps)
     monkeypatch.setattr(ar, "time", clock)
     try:
-        ar.run_watch(args, source=source)
+        ar._run_watch(args, source=source)
     except StopLoop:
         pass
     with open(args.log_file, encoding="utf-8") as fh:
@@ -146,7 +146,7 @@ def test_a_hit_then_reset_arms_then_fires_once(tmp_path, monkeypatch):
     args = _make_args(tmp_path)
     src = ar.UsageApiSource(args, log=lambda m: None, client=client)
     try:
-        ar.run_watch(args, source=src)
+        ar._run_watch(args, source=src)
     except StopLoop:
         pass
     with open(args.log_file, encoding="utf-8") as fh:
@@ -156,7 +156,7 @@ def test_a_hit_then_reset_arms_then_fires_once(tmp_path, monkeypatch):
     assert "armed on observed hit, persisted" in log
     assert log.count("DRY-RUN would inject") == 1, log
     assert "FIRE inject" in log and "window cleared" in log
-    assert "DONE injected+recorded" in log
+    assert "PREVIEW simulated" in log
     # arm cleared from the persisted state after firing.
     st = ar.load_state(args.state_file)
     assert st.get("arm") is None
@@ -179,7 +179,7 @@ def test_b_benign_reset_never_fires(tmp_path, monkeypatch):
     args = _make_args(tmp_path)
     src = ar.UsageApiSource(args, log=lambda m: None, client=client)
     try:
-        ar.run_watch(args, source=src)
+        ar._run_watch(args, source=src)
     except StopLoop:
         pass
     with open(args.log_file, encoding="utf-8") as fh:
@@ -206,7 +206,7 @@ def test_c_manual_time_fires_at_that_time(tmp_path, monkeypatch):
                               max_sleeps=60)
     assert "FIRE manual resume" in log, log
     assert log.count("DRY-RUN would inject") == 1, log
-    assert "DONE injected+recorded manual|" in log
+    assert "PREVIEW simulated manual|" in log
     # the manual request file is consumed after firing.
     assert ar.read_manual_request(manual_file) is None
     # fired at/after the scheduled time.
@@ -240,7 +240,7 @@ def test_d_arm_persists_across_restart(tmp_path, monkeypatch):
     client1 = ClockedUsageClient(clock1, reset_at=RESET_EPOCH + 10 ** 6)
     src1 = ar.UsageApiSource(args, log=lambda m: None, client=client1)
     try:
-        ar.run_watch(args, source=src1)
+        ar._run_watch(args, source=src1)
     except StopLoop:
         pass
     with open(args.log_file, encoding="utf-8") as fh:
@@ -259,14 +259,14 @@ def test_d_arm_persists_across_restart(tmp_path, monkeypatch):
     client2 = ClockedUsageClient(clock2, reset_at=RESET_EPOCH)   # already cleared
     src2 = ar.UsageApiSource(args, log=lambda m: None, client=client2)
     try:
-        ar.run_watch(args, source=src2)
+        ar._run_watch(args, source=src2)
     except StopLoop:
         pass
     with open(args.log_file, encoding="utf-8") as fh:
         log2 = fh.read()
     assert "RESUME persisted arm" in log2, log2
     assert log2.count("DRY-RUN would inject") == 1, log2      # fired once on restart
-    assert "DONE injected+recorded" in log2
+    assert "PREVIEW simulated" in log2
     st = ar.load_state(args.state_file)
     assert st.get("arm") is None                              # disarmed
     assert armed_key in st.get("handled", [])                # once-per-reset

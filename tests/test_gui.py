@@ -35,6 +35,7 @@ def check(cond, msg):
         _passed += 1
     else:
         _failed += 1
+        raise AssertionError(msg)
 
 
 # --------------------------------------------------------------------------- #
