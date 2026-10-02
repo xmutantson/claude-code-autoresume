@@ -2,12 +2,12 @@
 
 When a Claude Code session on a Max plan hits a usage limit (the rolling
 **session** window or the **weekly** window), the session stalls until the limit
-resets. `autoresume` polls the **authoritative usage endpoint** on a **fast fixed
-cadence (~30 s)** to see which quota is blocked and exactly **when** it resets,
-**arms** the moment a real hit is observed, then **fires the instant the window
-clears** (or at the reset time) by **typing a plain-language resume message into
-the focused Claude Code window and pressing Enter** — so unattended autonomous
-work continues on its own.
+resets. `autoresume` polls the **usage endpoint** on an **adaptive cadence**
+(180 seconds idle, up to 600 seconds between distant-reset checks, 30 seconds
+near reset by default). It **arms on an observed hit**, then resumes after fresh
+quota data confirms the blockers cleared. The default injector opens the bound
+Claude Code session through a VS Code URI and sends a guarded Enter.
+The transcript fallback waits until the reported reset plus the configured buffer.
 
 Detection uses the same data source as the **Usage Monitor for Claude**
 (`GET https://api.anthropic.com/api/oauth/usage`); the detection approach is
@@ -19,31 +19,10 @@ fallback for machines with no readable credentials.
 It replaces a blunt predecessor (see "Replaces the old AHK script" below) that
 blindly pressed Enter at a fixed 1:15 am.
 
-> **Version 0.3.0** — **fast direct polling + an arm-on-hit / fire-on-reset
-> state machine, plus a manual resume-time control.**
-> - **Fast direct polling.** autoresume now polls the usage endpoint **itself,
->   every ~30 s** (`--poll-interval`), *regardless* of whether the Usage Monitor
->   app is running. The old ~15-min courtesy backoff is **gone**: with a 15-min
->   blind gap a limit could be **hit and reset inside one gap**, so the reset was
->   missed and dead work never resumed. Continuous fast polling closes that hole.
-> - **Arm-on-hit / fire-on-reset.** When a focused limit window is *observed* at
->   ≥ 100 % (a real **HIT**) autoresume **ARMS** and persists `{armed, window,
->   resets_at}` to the state file. While armed it keeps polling and **FIRES** the
->   moment the armed window **clears** (utilization back below the block line) **or**
->   the reset time is reached — then disarms. It fires **only** if a hit was
->   observed: a window sitting at 0 % with **no prior observed hit never fires**.
->   The armed state **survives a restart**, so a reset that lands while the watcher
->   is briefly down is still picked up on the next poll.
-> - **Manual resume time.** Set an explicit time in the **GUI** ("Resume at
->   HH:MM" + Set/Clear, with a *manual-only* toggle) or via **`--resume-at`**
->   (`HH:MM | +Nm | ISO`). It fires at that time regardless of API detection —
->   handy when an error message already states the reset (“resets 3:10pm”).
->   Auto-detection stays on as a backstop unless *manual-only* is set.
->
-> **Version 0.2.0** — usage-API detection became the **primary** source
-> (`--source auto` uses it whenever credentials are readable); the transcript
-> watcher is a documented fallback. In `--source usage-api` no transcript text is
-> ever read, so the transcript self-contamination false-arm class is impossible.
+The watcher persists its pending target and delivery attempt before sending.
+Missing or ambiguous targets, a prefilled prompt without submission, and an
+interrupted delivery stay pending for inspection. Sending Enter does **not**
+acknowledge that the extension accepted or executed the message.
 
 The injected message tells the agent, in the owner's voice:
 
@@ -57,18 +36,16 @@ The injected message tells the agent, in the owner's voice:
 
 ## How it works
 
-```
-poll /api/oauth/usage every ~30s ─▶ blocked? (percent ≥ 100) ─▶ ARM + persist
-        ▲                                                              │
-        │                        keep polling (fire-on-clear)          ▼
-        └── loop ◀ inject msg+Enter ◀ window CLEARED  or  reset time reached ✓
+```text
+poll usage -> observed blocker -> persist arm + session/workspace
+    -> wait and confirm all observed blockers -> journal delivery -> URI + Enter
+    -> record submitted; hold uncertain attempts for inspection
 ```
 
-1. **Poll the usage endpoint — fast and direct.**
-   `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token, on a
-   **fixed ~30 s cadence** (`--poll-interval`), **always** — no monitor-aware
-   backoff. All credential + network code lives in `usage_api.py`; **the token is
-   never logged, printed, or stored.**
+1. **Poll the usage endpoint.** `GET https://api.anthropic.com/api/oauth/usage`
+   uses adaptive polling independent of the Usage Monitor. HTTP 429 suppresses
+   both idle and armed calls through the full `Retry-After` deadline. Credential
+   and network code lives in `usage_api.py`; the token is never logged.
 
 2. **Decide blocked.** A quota is **blocked** when its `percent` / `utilization`
    is **≥ 100** — checked across both the `limits[]` array and the top-level
@@ -85,13 +62,13 @@ poll /api/oauth/usage every ~30s ─▶ blocked? (percent ≥ 100) ─▶ ARM + 
    several quotas block, the **latest** reset wins. Spend / monthly caps have no
    timed reset → logged "cannot auto-resume" and skipped.
 
-4. **Fire on clear (or at reset time).** While armed, autoresume keeps polling on
-   the same fast cadence and **fires the instant the armed window clears** — its
-   utilization drops back below the block line (a reset drops the window to ~0) —
-   **or** when `fire_at` is reached. It **never resumes into a still-blocked
-   account**: if the reset time has passed but the server still reports the window
-   ≥ 100 %, it waits and re-checks. Crucially it fires **only if a hit was
-   observed** (armed): a window at 0 % with no prior hit **never** fires.
+4. **Confirm before resuming.** While armed, fresh usage data must show no
+   reported blocker and all previously observed blockers below `--confirm-below`
+   (90% by default). Previously reported quota data must remain present and
+   valid. Missing, malformed, or nonfinite values hold the resume. A newly blocked
+   quota also holds it. Reaching the scheduled time alone never authorizes API
+   delivery. The transcript source has no live counter, so it waits until reset
+   **plus buffer**, without claiming an early clear.
 
    **Early / unexpected reset (v0.6.0).** Because it fires on the *clear*, a quota
    that resets **earlier than its reported `resets_at`** (the server applying the
@@ -102,11 +79,12 @@ poll /api/oauth/usage every ~30s ─▶ blocked? (percent ≥ 100) ─▶ ARM + 
    resets again** (`usage_api.weekly_reset`), so an autonomous agent can budget its
    work to that window. A matching `EARLY RESET … resuming now` line is logged.
 
-5. **Dedup + inject.** Each reset collapses to a `(KIND, reset-minute)` key; a
-   persisted watermark (`state.json`) ensures **exactly one** injection per reset,
-   even across restarts. To inject it picks the target window (**foreground-first**,
-   see below), verifies it, types the message as literal Unicode keystrokes, and
-   presses Enter.
+5. **Dedup and journal delivery.** A `(KIND, reset-minute)` key suppresses
+   completed events across restart. An OS lock permits one watcher per state
+   file. The pending target is persisted at arm time. Before external input, a
+   delivery journal records the attempt; interrupted or prefilled attempts are
+   held rather than automatically repeated. This is duplicate prevention, not
+   an exactly-once guarantee from the extension. See recovery below.
 
 6. **Manual override.** A manual resume time (GUI / `--resume-at`) fires at a set
    wall-clock time regardless of API detection; see "Manual resume time" below.
@@ -138,17 +116,51 @@ transcript-text detector remains available as `--source transcript`.)
 The token is read fresh on every request (so a token the CLI refreshes is picked
 up), used **only** in the `Authorization` header, and never written anywhere.
 
-### Fast direct polling (no monitor dependency)
+### Adaptive direct polling (no monitor dependency)
 
-autoresume polls the usage endpoint **directly and continuously** at
-`--poll-interval` (**default 30 s**), whether or not the **Usage Monitor for
-Claude** app is running. The Usage Monitor's presence is only **logged** (for
-information); it never changes the cadence. This is a deliberate change from
-v0.2.0's ~15-min courtesy backoff, which had a real hole: a limit could be **hit
-and reset inside one 15-min blind gap**, so the reset was missed and dead work
-never resumed. Polling itself, fast and continuously, is what closes that hole —
-combined with the arm-on-hit / fire-on-clear machine above, an observed hit is
-followed to its reset within one poll.
+The idle `--poll-interval` defaults to **180 seconds**. While armed, distant
+resets are checked every `--armed-drift-recheck` (**600 seconds**); near or past
+the scheduled time, `--confirm-interval` (**30 seconds**, bounded by a faster
+idle interval) controls confirmation. Unexpected early resets can therefore
+take up to the distant-reset interval to detect. The usage monitor's presence
+is informational and never changes this cadence. HTTP 429 backoff takes priority.
+
+### Delivery recovery and preserved choices
+
+- **Targets are bound when an automatic hit is armed or a manual request is
+  first observed.** A newer transcript cannot silently redirect it. URI mode
+  requires a session and workspace, exactly one matching workspace title, and
+  the selected window handle in the foreground before opening the URI and
+  before Enter. It never silently falls back to keystrokes. Workspace names
+  derived from transcript `cwd` remain a heuristic; use `--session-id` and
+  `--workspace-title` when the inferred choice is unsuitable.
+- **ATTENTION means inspect the conversation.** A prompt was prefilled without
+  submission, or a crash left delivery uncertain. In the GUI, **Cancel reset**
+  discards that held event without sending; **Inject now** explicitly retries
+  that same recorded event and target. Remove any leftover draft before retrying.
+  A separate automatic pending event is preserved when resolving a held manual
+  event. Headless users can stop the process and open `watch --gui` with the same
+  `--state-file` and `--manual-file` to make this recovery choice.
+- **Cancellation survives restart and polling.** It cannot be undone by the
+  legacy recovery heuristic for previously handled future resets. Successfully
+  submitted events also cannot be automatically rearmed while still blocked.
+- **Old arms without target metadata hold in URI mode.** Restart with both
+  `--session-id` and `--workspace-title` to migrate that arm, or cancel it.
+  Already bound events retain their choices; changing CLI defaults does not
+  retarget them.
+- **`--dry-run` uses temporary copies of state, manual requests, and the stop
+  file, including GUI controls.** It never consumes live pending work. Logs
+  still append to `--log-file`; choose a separate log for an isolated preview.
+  Detection may still read credentials/transcripts and poll the usage endpoint;
+  dry-run is not an offline mode. It suppresses automatic auth-update launches.
+- **ERROR means the watcher stopped.** It no longer presents a worker crash as
+  successful delivery. Closing the GUI stops its worker before deleting preview
+  files. Malformed state files fail closed and remain untouched.
+
+The lock is scoped to the state-file path: use the same path for competing
+watchers of one session. Separate state files and direct `inject-now` commands
+are not mutually deduplicated. OS window focus and URI handling cannot be made
+atomic; these guards cannot establish extension-level acknowledgment.
 
 ### Manual resume time (GUI / `--resume-at`)
 
@@ -167,7 +179,7 @@ detection:
 The GUI and CLI share one **manual-request file** (default
 `%TEMP%\autoresume.manual.json`, `--manual-file`) — the same filesystem-IPC
 pattern as the kill-switch stop-file — so a manual time is honoured headless and
-across restarts, and fires exactly once (deduped like an auto reset).
+across restarts, with the same delivery journal and deduplication as auto resets.
 
 ### Source selection (`--source`)
 
@@ -199,7 +211,7 @@ vscode://anthropic.claude-code/open?session=<SESSION_ID>&prompt=<URL_ENCODED_MES
   autoresume sends exactly **one** Enter to submit (reusing the correct-window
   guard, so it never Enters into a non-VS-Code window).
 
-What autoresume does per fire:
+What autoresume does for each pending event:
 
 1. Derive the target — **session id** = the newest (or tailed) transcript's
    filename minus `.jsonl`; **workspace folder** = `basename` of that session's
@@ -219,17 +231,20 @@ What autoresume does per fire:
 - **The session must belong to the focused window's workspace**, else the
   extension opens a **fresh** conversation — so window targeting still matters
   (step 2). `--workspace-title` forces the disambiguator; `basename(cwd)` is a
-  heuristic (it can read a *subfolder* name if the session `cd`'d into one — but
-  it usually substring-matches the workspace title anyway, and `session=<id>`
-  still focuses the exact tab regardless of which window is foregrounded).
+  heuristic: directory changes can yield a subfolder name, and different windows
+  can share a basename. Use a unique workspace-title substring when needed.
 - **Requires a recent extension build** that understands the `session` param. On
   an older build the URI is a no-op (nothing pre-fills); the fire is logged so a
   silent no-op is diagnosable. Fall back with `--injector win32`.
 - `--dry-run` (watch) and `inject-now --dry-run` **log the exact URI** without
   firing it — verify the `session=` and url-encoded `prompt=` before going live.
 
-`--injector win32` restores the legacy keystroke path below; `--injector ahk`
-uses the AutoHotkey fallback.
+`--injector win32` restores the legacy keystroke path below. The legacy
+`--injector ahk` adapter is disabled: it returns `ahk-disabled` without launching
+any process, and `inject.ahk` exits with code 5 without activating a window or
+sending input. It could not verify the configured workspace, session, and Claude
+input. Configure the default URI injector instead; pending requests remain
+unsubmitted until an enabled injector succeeds.
 
 ### `--injector win32` — legacy keystroke path *(fallback)*
 
@@ -282,35 +297,34 @@ default binding.
 > `--focus-method palette` (needs no keybindings.json edit) or set the
 > `FOCUS_METHOD` constant in `autoresume.py`.
 
-**Fallback:** `inject.ahk` (AutoHotkey v2, the owner's toolchain) does the same
-`WinActivate` → `SendText` → `{Enter}`. Run the watcher with `--injector ahk` to
-use it. (In testing on this machine the Python `SendInput` path was the more
-reliable of the two into hard input surfaces, so it is the default.)
+**Legacy AHK adapter:** `--injector ahk` runs `inject.ahk`, which uses its own
+`Code.exe` target and active-window checks. It does not implement URI session
+binding or the Python target preferences; its successful exit is not an
+application acknowledgment. `inject-now --injector ahk --no-enter` is rejected
+before running the adapter because the script always submits. Prefer URI mode
+for session targeting.
 
 Fail-safes, all implemented:
 
 - **Fire only on an observed hit.** autoresume arms **only** after seeing a window
   at ≥ 100 %. A window at 0 % with no prior observed hit — a benign reset — is
   **never** injected. (Tested: `test_state_machine.py::test_b_benign_reset_never_fires`.)
-- **Fire-on-clear / never into a blocked account.** While armed it re-polls on the
-  fast cadence and injects the moment the window **clears** (utilization back below
-  the block line) or the reset time arrives. If the reset time passes but the
-  server still reports the window ≥ 100 %, it **waits and re-checks** — it never
-  resumes into a still-blocked account.
+- **Confirm all blockers.** Automatic API delivery requires fresh complete
+  quota data and all observed blockers cleared. Transcript mode waits for the
+  scheduled time plus buffer. Manual overrides deliberately bypass quota checks.
 - **Persisted arm survives a restart.** The armed `{window, resets_at, fire_at}`
   is written to `state.json`; a restart reloads it, so a reset that lands during a
   brief downtime still fires on the next poll.
-- **Correct-window guard.** It types **only** if the *foreground* window is the
-  target (right process **and** title). If activation fails or another app is in
-  front, it **aborts and logs** — it never sprays a paragraph into the wrong
-  window. (A stray Enter was cheap for the old script; a stray paragraph is not.)
-- **Exactly once per reset.** The `(KIND, reset-minute)` watermark in `state.json`
-  guarantees a single injection per reset, across restarts, ignoring the retry
-  storm. A manual resume dedups the same way (`manual|<minute>`).
+- **Correct-window guard.** Python injectors check the exact selected window
+  handle as well as process and title before sending input. Failed activation
+  never opens the URI. `SendInput` short writes raise an uncertain-delivery error.
+- **Deduplication and recovery.** Submitted events stay handled; interrupted
+  or prefilled attempts require inspection. The delivery journal does not promise
+  exactly-once execution inside Claude Code.
 - **No spam loop.** A global minimum interval between any two injections
   (default 60 s) as a backstop.
-- **Reset buffer.** An auto reset fires at reset **+ buffer** (default 45 s), never
-  exactly on the reset instant. (A manual `--resume-at` fires at the set time.)
+- **Reset buffer.** Transcript fallback waits for reset **+ buffer** (45 s).
+  API mode may resume earlier after a confirmed clear; manual times are explicit.
 - **Kill switch.** If the stop-file (`%TEMP%\autoresume.stop`) exists, detection
   and logging continue but injection (auto **and** manual) is **held** until the
   file is removed.
@@ -320,6 +334,13 @@ Fail-safes, all implemented:
   the OAuth token is never logged, printed, or stored.
 - **Full logging** of every poll decision (quota, percent, resolved reset) and
   every action (target window title + why, injected/held/aborted-and-why).
+
+A persisted automatic or manual request with a missing or incomplete target can
+be repaired by restarting with **both** `--session-id` and `--workspace-title`.
+The complete explicit pair is saved before delivery. An already complete target
+remains bound to its original session/workspace, even if restart options differ.
+Partial options and newly discovered transcripts cannot repair a persisted
+unresolved target; delivery stays held until an explicit complete pair is given.
 
 State, log, kill-switch, and manual-request locations:
 
@@ -378,7 +399,8 @@ Useful options (`watch`):
 |------|---------|---------|
 | `--source {auto,usage-api,transcript}` | auto | detection source (see table above) |
 | `--buffer N` | 45 | seconds after reset before injecting (auto) |
-| `--poll-interval N` (alias `--usage-poll`) | 30 | **direct** usage-endpoint poll cadence (s); also the fire-on-clear re-poll cadence while armed |
+| `--poll-interval N` (alias `--usage-poll`) | 180 | idle usage-endpoint poll cadence (s) |
+| `--armed-drift-recheck N` | 600 | distant-reset confirmation cadence (s) |
 | `--resume-at HH:MM\|+Nm\|ISO` | (none) | **manual** resume time — fire at this time regardless of API detection |
 | `--manual-only` | off | fire only the manual time; suppress auto-detection while set |
 | `--manual-file PATH` | `%TEMP%\autoresume.manual.json` | shared GUI/CLI manual-request file |
@@ -393,7 +415,7 @@ Useful options (`watch`):
 | `--uri-extra-enter` | off | uri: send a **second** Enter (for setups where a one-time "open external app?" confirmation eats the first) |
 | `--focus-method {keybind,palette,none}` | keybind | `win32` injector only: how to focus the Claude Code chat input before typing |
 | `--prefer-title SUBSTR` | (none) | override: force this VS Code window as the target |
-| `--dry-run` | off | detect + log, but **never** type |
+| `--dry-run` | off | simulate with temporary state/control copies; no input; detection and logs remain active |
 | `--target-proc` / `--target-title` | `Code.exe` / `Visual Studio Code` | window match |
 | `--poll N` | 5 | loop tick (s): kill-switch / GUI responsiveness |
 | `--watch-dir DIR` | auto-detected project dir | transcript fallback: where to tail |
@@ -513,17 +535,16 @@ python tests/test_guard.py      # correct-window guard fail-safes
   the foreground window's title/process do not match, and accepts only the
   correct foreground window.
 
-**What can and cannot be validated without a real reset:** the parse (KIND +
-reset + tz), the dedup/watermark, the kill switch, the full watch→schedule→fire
-pipeline (via `--dry-run`), and the keystroke injection are all tested now. The
-only step that only fully validates on the **next real limit reset** is the live
-Claude Code chat input accepting the focus gesture + typed line + Enter — but the
-keystroke path is the identical `SendInput` path proven by `test_inject.py`, and
-the focus command ID / keybinding are verified statically (command exists in the
-extension; `keybindings.json` is valid). To smoke-test focus + typing end-to-end
-without submitting into the live session, run
-`python autoresume.py inject-now "<harmless probe>" --no-enter` while the Claude
-Code panel is open, watch it focus and land the probe, then clear it (no Enter).
+**Validation boundary:** the offline suite checks scheduling, persistence,
+recovery, and mocked window guards. It does not verify the current extension's
+URI routing, actual desktop focus/input, AutoHotkey behavior, credential refresh,
+or the live usage endpoint. The standalone desktop/GUI smoke harnesses require
+an explicit interactive session and are not part of the offline test run.
+
+**Deferred product decisions:** quota detection remains account-wide across all
+reported scopes, as before; model-specific filtering needs an explicit session
+model policy. Message templates retain the owner's existing worklog wording.
+Configurable message profiles and an interactive session picker are future work.
 
 ---
 
@@ -560,8 +581,10 @@ is what `--source auto` uses when no credential is readable), but it is no longe
 the default: matching on transcript **text** can false-arm on quoted/replayed
 lines (e.g. fixtures or docs the session itself prints), which is exactly why the
 usage-API source — which reads structured `utilization` numbers, never text — is
-now primary. In `--source usage-api` **no transcript text is ever read**, so that
-false-arm class is impossible.
+now primary. When the API detector is active, transcript text is not used to
+detect quota hits. Target binding may still read transcript metadata. With no
+readable credentials, even explicit `--source usage-api` falls back to the
+transcript detector, where text-matching limitations still apply.
 
 ---
 

@@ -40,6 +40,7 @@ Standard library only (urllib) -- no third-party packages.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import socket
@@ -125,8 +126,9 @@ def read_access_token(cred_path: str | None = None):
             data = json.load(fh)
     except (OSError, ValueError):
         return None
-    tok = (data.get("claudeAiOauth") or {}).get("accessToken")
-    return tok or None
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    tok = oauth.get("accessToken") if isinstance(oauth, dict) else None
+    return tok if isinstance(tok, str) and tok else None
 
 
 def credentials_available(cred_path: str | None = None) -> bool:
@@ -176,7 +178,8 @@ def _parse_retry_after(value):
     if not value:
         return None
     try:
-        return float(str(value).strip())
+        seconds = float(str(value).strip())
+        return seconds if math.isfinite(seconds) and seconds >= 0 else None
     except (TypeError, ValueError):
         return None  # HTTP-date form: fall back to caller's default backoff
 
@@ -196,7 +199,10 @@ def fetch_usage(token=None, cli_version=None, timeout=20, url=USAGE_URL,
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", errors="replace")
-        return json.loads(body)
+        data = json.loads(body)
+        if not isinstance(data, dict):
+            raise UsageAPIError("usage response must be an object")
+        return data
     except urllib.error.HTTPError as e:
         code = getattr(e, "code", 0)
         if code == 401:
@@ -216,8 +222,8 @@ def fetch_usage(token=None, cli_version=None, timeout=20, url=USAGE_URL,
         # token out of any traceback. Only the reason string is surfaced.
         reason = getattr(e, "reason", None) or e.__class__.__name__
         raise ConnectionFailed(str(reason)) from None
-    except ValueError as e:  # json decode
-        raise UsageAPIError(f"bad JSON response ({e})") from None
+    except ValueError:  # json decode; never include response content
+        raise UsageAPIError("invalid JSON usage response") from None
 
 
 class UsageClient:
@@ -317,8 +323,15 @@ def _dedup_key(quota):
     return (quota["label"], minute)
 
 
+def _percentage(value):
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise ValueError("invalid quota percentage")
+    return number
+
+
 def _is_blocked(percent, severity, threshold):
-    if percent is not None and float(percent) >= threshold:
+    if percent is not None and _percentage(percent) >= threshold:
         return True
     if severity and str(severity).lower() in _EXHAUSTED_SEVERITIES:
         return True
@@ -335,7 +348,7 @@ def iter_quota_utilizations(usage: dict):
             continue
         yield {
             "label": friendly_label(lim.get("kind"), lim.get("group")),
-            "percent": float(pct),
+            "percent": _percentage(pct),
             "resets_at": parse_resets_at(lim.get("resets_at")),
         }
     for key in _TOP_LEVEL_KEYS:
@@ -347,7 +360,7 @@ def iter_quota_utilizations(usage: dict):
             continue
         yield {
             "label": friendly_label(key, key),
-            "percent": float(util),
+            "percent": _percentage(util),
             "resets_at": parse_resets_at(obj.get("resets_at")),
         }
 
@@ -370,7 +383,7 @@ def find_blocked_quotas(usage: dict, threshold: float = BLOCK_THRESHOLD):
         ra_raw = lim.get("resets_at")
         q = _make_quota(
             friendly_label(kind, group), kind, group,
-            float(pct) if pct is not None else None,
+            _percentage(pct) if pct is not None else None,
             parse_resets_at(ra_raw), ra_raw, lim.get("severity"), "limits",
         )
         k = _dedup_key(q)
@@ -389,7 +402,7 @@ def find_blocked_quotas(usage: dict, threshold: float = BLOCK_THRESHOLD):
         ra_raw = obj.get("resets_at")
         q = _make_quota(
             friendly_label(key, key), key, key,
-            float(util) if util is not None else None,
+            _percentage(util) if util is not None else None,
             parse_resets_at(ra_raw), ra_raw, obj.get("severity"), "top-level",
         )
         k = _dedup_key(q)
@@ -439,7 +452,7 @@ def is_quota_reset(usage: dict, quota: dict, below: float = RESET_CONFIRM_BELOW)
 
     Matches by friendly label (so limits[] 'session' and top-level 'five_hour'
     are the same quota). Reset means its current utilization dropped below
-    `below`, or the quota is no longer reported at all. A quota still at/above
+    `below`. Missing quota data cannot confirm a reset. A quota still at/above
     `below` means the server has not applied the reset yet -> not reset."""
     label = quota.get("label")
     current = None
@@ -447,5 +460,5 @@ def is_quota_reset(usage: dict, quota: dict, below: float = RESET_CONFIRM_BELOW)
         if q["label"] == label:
             current = q["percent"] if current is None else max(current, q["percent"])
     if current is None:
-        return True  # quota no longer present -> treat as reset
+        return False  # missing quota data cannot confirm a reset
     return current < below

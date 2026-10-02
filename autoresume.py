@@ -29,7 +29,8 @@ ARM-ON-HIT / FIRE-ON-RESET state machine: the watcher polls continuously. When a
 focused limit window is OBSERVED at utilization >= 100% (a real HIT) it ARMS and
 persists {armed, window, resets_at} to the state file. While ARMED it keeps
 polling and FIRES the resume the moment the armed window CLEARS (utilization drops
-back below the block line) OR the reset time is reached -- then DISARMS. It fires
+back below the block line) -- then DISARMS. Transcript fallback waits for the
+reported reset plus buffer. It fires
 ONLY if a hit was actually observed: a window sitting at 0% with no prior observed
 hit NEVER fires. The armed state survives a watcher restart (reloaded from the
 state file), so a reset that lands while the watcher is briefly down is still
@@ -53,8 +54,8 @@ AutoHotkey hack) with limit-aware detection, focused-window targeting,
 send-once-per-reset dedup, a kill switch, and full logging.
 
 Design: detection/schedule/dedup in Python (stdlib: json + datetime + urllib +
-zoneinfo/tzdata); injection via pure Win32 SendInput (no third-party deps). An
-AHK v2 fallback injector (inject.ahk) is provided as an alternative.
+zoneinfo/tzdata); injection via pure Win32 SendInput (no third-party deps).
+The legacy AHK injector is disabled because it cannot verify the target input.
 
 No external Python packages are required beyond the standard library plus
 `tzdata` (already present) for zoneinfo on Windows.
@@ -104,6 +105,10 @@ __version__ = "0.6.0"   # 0.6.0: RESUME EARLY on an UNEXPECTED reset + tell the
                         #        across restarts), GUI + CLI manual resume time
 
 import argparse
+import copy
+import shutil
+import tempfile
+from contextlib import contextmanager
 import ctypes
 import glob
 import json
@@ -576,7 +581,7 @@ def select_target_window(proc_name=TARGET_PROC, title_substr=TARGET_TITLE,
     """Pick the injection target FOREGROUND-FIRST (owner: "whichever is currently
     in focus"). Order of preference:
 
-      1. `prefer_substr` override -- if set and a window's title matches, use it.
+      1. `prefer_substr` override -- if set, require one unambiguous title match.
       2. The CURRENT foreground window, if it is one of the matching VS Code
          windows (right process + title). This is the common case: type into the
          window the owner left focused.
@@ -595,9 +600,11 @@ def select_target_window(proc_name=TARGET_PROC, title_substr=TARGET_TITLE,
         return None, None, "no-target-window"
 
     if prefer_substr:
-        for hwnd, title in matches:
-            if prefer_substr.lower() in title.lower():
-                return hwnd, title, "prefer-title override"
+        preferred = [(hwnd, title) for hwnd, title in matches
+                     if prefer_substr.lower() in title.lower()]
+        if len(preferred) == 1:
+            return *preferred[0], "prefer-title override"
+        return None, None, "workspace missing or ambiguous"
 
     fg = user32.GetForegroundWindow()
     if fg:
@@ -639,7 +646,10 @@ def _kb(wVk, wScan, flags) -> INPUT:
 
 def _send(inputs) -> int:
     arr = (INPUT * len(inputs))(*inputs)
-    return user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
+    sent = user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
+    if sent != len(inputs):
+        raise RuntimeError(f"delivery uncertain: SendInput accepted {sent}/{len(inputs)} events")
+    return sent
 
 
 TYPE_CHAR_DELAY = 0.020   # seconds between characters; a single large SendInput
@@ -732,13 +742,15 @@ def focus_claude_input(method=None, settle=None, log=None) -> bool:
     return True
 
 
-def foreground_matches(proc_name=TARGET_PROC, title_substr=TARGET_TITLE):
+def foreground_matches(proc_name=TARGET_PROC, title_substr=TARGET_TITLE, hwnd=None):
     """Return (ok, fg_title) where ok is True iff the CURRENT foreground window
     belongs to proc_name and its title contains title_substr."""
     fg = user32.GetForegroundWindow()
     if not fg:
         return False, ""
     title = _window_title(fg)
+    if hwnd is not None and fg != hwnd:
+        return False, title
     if title_substr.lower() not in title.lower():
         return False, title
     img = _proc_image_basename(_window_pid(fg))
@@ -812,42 +824,43 @@ def inject_message(message: str, proc_name=TARGET_PROC, title_substr=TARGET_TITL
     _log(f"TARGET window {title!r} ({reason})")
 
     # Correct-window guard, with one activation retry.
-    ok, fg_title = foreground_matches(proc_name, title_substr)
+    ok, fg_title = foreground_matches(proc_name, title_substr, hwnd=hwnd)
     if not ok:
         activate_window(hwnd)
         time.sleep(settle)
-        ok, fg_title = foreground_matches(proc_name, title_substr)
+        ok, fg_title = foreground_matches(proc_name, title_substr, hwnd=hwnd)
     if not ok:
         _log(f"ABORT inject: foreground guard failed (fg={fg_title!r}); "
              f"refusing to type into a non-target window")
         return False, f"foreground-guard-failed:{fg_title!r}"
 
     time.sleep(settle)
+    if not foreground_matches(proc_name, title_substr, hwnd=hwnd)[0]:
+        return False, "foreground-changed-before-focus"
     # Focus the Claude Code extension chat input BEFORE typing. The target is the
     # chat PANEL, not the integrated terminal -- foregrounding the window does not
     # focus the input, so without this the message would be typed into whatever
     # element last held focus (editor / webview). See focus_claude_input.
     focus_claude_input(method=focus_method, log=log)
+    ok, fg_title = foreground_matches(proc_name, title_substr, hwnd=hwnd)
+    if not ok:
+        return False, "foreground-changed-before-typing"
     n = type_unicode(message)
     if press_enter:
         time.sleep(0.05)
+        if not foreground_matches(proc_name, title_substr, hwnd=hwnd)[0]:
+            return False, "prefilled-not-submitted:foreground-changed"
         press_vk(VK_RETURN)
     _log(f"INJECTED into {fg_title!r}: typed {n} events, "
          f"enter={'yes' if press_enter else 'no'}")
-    return True, fg_title
+    return bool(press_enter), fg_title if press_enter else "prefilled-not-submitted"
 
 
 def inject_via_ahk(message: str, ahk_exe: str, ahk_script: str, log=None):
-    """Fallback injector: shell out to inject.ahk (AutoHotkey v2)."""
-    import subprocess
-    if not (os.path.isfile(ahk_exe) and os.path.isfile(ahk_script)):
-        if log:
-            log(f"ABORT inject(ahk): missing exe/script ({ahk_exe} / {ahk_script})")
-        return False, "ahk-missing"
-    rc = subprocess.call([ahk_exe, ahk_script, message], creationflags=_NO_WINDOW)
+    """Disabled: the legacy script cannot verify the configured Claude input."""
     if log:
-        log(f"inject(ahk) rc={rc}")
-    return rc == 0, f"ahk-rc-{rc}"
+        log("HOLD delivery: AHK injector disabled; use the configured URI injector")
+    return False, "ahk-disabled"
 
 
 # --------------------------------------------------------------------------- #
@@ -949,22 +962,17 @@ def inject_via_uri(message: str, session_id: str, workspace_title: str,
         workspace_title or PREFER_TITLE)
     hwnd, title, reason = select_target_window(proc_name, title_substr, prefer,
                                                log=log)
-    fg_ok = False
-    if hwnd:
-        _log(f"TARGET window {title!r} ({reason})")
-        fg_ok, fg_title = foreground_matches(proc_name, title_substr)
-        if not fg_ok:
-            activate_window(hwnd)
-            time.sleep(settle)
-            fg_ok, fg_title = foreground_matches(proc_name, title_substr)
-        if not fg_ok:
-            _log(f"WARN inject(uri): foreground guard failed (fg={fg_title!r}); "
-                 f"firing the URI anyway (session=<id> targets the exact tab, but "
-                 f"if the focused workspace differs the extension may open a fresh "
-                 f"chat)")
-    else:
-        _log(f"WARN inject(uri): no VS Code window matched (proc={proc_name} "
-             f"title~{title_substr!r}); firing the URI to let the OS route it")
+    if not hwnd:
+        return False, "no-target-window"
+    if prefer and prefer.lower() not in title.lower():
+        return False, "workspace-mismatch"
+    fg_ok, fg_title = foreground_matches(proc_name, title_substr, hwnd=hwnd)
+    if not fg_ok:
+        activate_window(hwnd)
+        time.sleep(settle)
+        fg_ok, fg_title = foreground_matches(proc_name, title_substr, hwnd=hwnd)
+    if not fg_ok:
+        return False, f"foreground-guard-failed:{fg_title!r}"
 
     # 2) Fire the deep link.
     rc = fire(url)
@@ -981,22 +989,24 @@ def inject_via_uri(message: str, session_id: str, workspace_title: str,
     if not press_enter:
         _log("inject(uri): prompt PRE-FILLED, Enter suppressed (--no-enter / "
              "test); submit manually")
-        return True, f"prefilled:{workspace_title or 'uri'}"
+        return False, f"prefilled-not-submitted:{workspace_title or 'uri'}"
 
     # 4) Submit with ONE Enter -- guarded so we never Enter into a non-VS-Code
     #    window (the URI may have popped a confirmation that stole focus, or the
     #    handler brought a different app forward).
-    ok, fg_title = foreground_matches(proc_name, title_substr)
+    ok, fg_title = foreground_matches(proc_name, title_substr, hwnd=hwnd)
     if not ok and hwnd:
         activate_window(hwnd)
         time.sleep(0.2)
-        ok, fg_title = foreground_matches(proc_name, title_substr)
+        ok, fg_title = foreground_matches(proc_name, title_substr, hwnd=hwnd)
     if not ok:
         _log(f"HOLD inject(uri) Enter: foreground is {fg_title!r}, not VS Code; "
              f"the URI pre-filled the prompt but NOT submitting (refusing Enter "
              f"into the wrong window). Submit manually, or use --injector win32.")
-        return True, f"prefilled-not-submitted:{fg_title!r}"
+        return False, f"prefilled-not-submitted:{fg_title!r}"
     time.sleep(0.05)
+    if not foreground_matches(proc_name, title_substr, hwnd=hwnd)[0]:
+        return False, "prefilled-not-submitted:foreground-changed"
     press_vk(VK_RETURN)
     if extra_enter:
         # Environments where a one-time "open external app?" confirmation eats
@@ -1004,6 +1014,8 @@ def inject_via_uri(message: str, session_id: str, workspace_title: str,
         # pre-filled prompt. Harmless when no dialog appeared (an empty second
         # submit is a no-op in the Claude input).
         time.sleep(uri_settle)
+        if not foreground_matches(proc_name, title_substr, hwnd=hwnd)[0]:
+            raise RuntimeError("delivery uncertain: foreground changed after first Enter")
         press_vk(VK_RETURN)
     _log(f"INJECTED via URI into {fg_title!r}: session={session_id} submitted "
          f"with {'two Enters' if extra_enter else 'one Enter'}")
@@ -1020,7 +1032,7 @@ def _ensure_state_dir():
 
 
 def log_event(message: str, log_file=LOG_FILE, echo=True):
-    _ensure_state_dir()
+    os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
     line = f"{datetime.now().isoformat(timespec='seconds')} {message}"
     with open(log_file, "a", encoding="utf-8") as fh:
         fh.write(line + "\n")
@@ -1037,13 +1049,16 @@ def log_event(message: str, log_file=LOG_FILE, echo=True):
 def load_state(state_file=STATE_FILE) -> dict:
     try:
         with open(state_file, encoding="utf-8") as fh:
-            return json.load(fh)
-    except (FileNotFoundError, json.JSONDecodeError):
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            raise ValueError("state file must contain an object; original preserved")
+        return data
+    except FileNotFoundError:
         return {"handled": []}
 
 
 def save_state(state: dict, state_file=STATE_FILE):
-    _ensure_state_dir()
+    os.makedirs(os.path.dirname(os.path.abspath(state_file)), exist_ok=True)
     tmp = state_file + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(state, fh, indent=2)
@@ -1057,6 +1072,19 @@ def handled_key(kind: str, reset_epoch: float) -> str:
 
 def is_handled(state: dict, key: str) -> bool:
     return key in state.get("handled", [])
+
+
+def mark_submitted(state: dict, key: str):
+    """Submitted events never use the legacy premature-handled rearm heuristic."""
+    submitted = state.setdefault("submitted", [])
+    if key not in submitted:
+        submitted.append(key)
+        del submitted[:-200]
+    mark_handled(state, key)
+
+
+def delivery_needs_attention(state):
+    return (state.get("delivery") or {}).get("status") in {"attempting", "prefilled"}
 
 
 def mark_handled(state: dict, key: str):
@@ -1199,6 +1227,9 @@ def save_arm(state: dict, pending: dict, state_file=STATE_FILE):
         "meta": {"label": (pending.get("meta") or {}).get("label")
                  or pending.get("kind")},
         "observed_at": pending.get("observed_at", time.time()),
+        "target": pending.get("target"),
+        "quota_labels": pending.get("quota_labels", []),
+        "blocked_labels": pending.get("blocked_labels", []),
     }
     save_state(state, state_file)
 
@@ -1231,6 +1262,9 @@ def restore_arm(state: dict, now=None):
         "fire_at": float(arm["fire_at"]),
         "meta": arm.get("meta") or {"label": arm.get("kind")},
         "observed_at": arm.get("observed_at"),
+        "target": arm.get("target"),
+        "quota_labels": arm.get("quota_labels", []),
+        "blocked_labels": arm.get("blocked_labels", []),
     }
 
 
@@ -1468,7 +1502,7 @@ class Tailer:
 #                                                                              #
 # Each source also answers:                                                    #
 #   confirm_reset(pending, log) -> (bool, detail): at fire time, has the reset  #
-#       actually been applied? (usage-API re-polls; transcript can't, so True.) #
+#       actually been applied? (API re-polls; transcript waits for fire_at.)   #
 #   loop_tick(pending, now, args) -> float: seconds to sleep before next tick.  #
 # --------------------------------------------------------------------------- #
 
@@ -1494,9 +1528,10 @@ class TranscriptSource:
         return list(self.tailer.poll())
 
     def confirm_reset(self, pending, log):
-        # The transcript has no live usage counter to re-poll; the parsed reset
-        # time has already passed, so fire.
-        return True, "transcript (no live re-poll; reset time elapsed)"
+        # Without a live usage counter, only elapsed reset + buffer permits fire.
+        due = time.time() >= float(pending["fire_at"])
+        return due, ("transcript (scheduled reset + buffer elapsed)" if due
+                     else "transcript waiting for scheduled reset + buffer")
 
     def loop_tick(self, pending, now, args):
         return args.poll
@@ -1540,7 +1575,7 @@ class UsageApiSource:
         # FAST-confirm cadence used near/after the reset while armed -- never
         # slower than the idle cadence, capped at USAGE_POLL_INTERVAL so we catch
         # the exact clear even when idle polling is deliberately slow.
-        self.confirm_fast = max(1.0, min(float(self.normal), float(USAGE_POLL_INTERVAL)))
+        self.confirm_fast = max(1.0, min(float(self.normal), float(getattr(args, "confirm_interval", CONFIRM_INTERVAL))))
         self.drift_recheck = float(getattr(args, "armed_drift_recheck",
                                            ARMED_DRIFT_RECHECK))
         # Retained for API/test compatibility; no longer used to back off cadence.
@@ -1593,8 +1628,10 @@ class UsageApiSource:
                      f"resets_at={quota.get('resets_at_str')})"),
         }
 
-    def _fetch(self):
+    def _fetch(self, now=None):
         """Fetch usage, mapping typed errors to a backoff + returning None."""
+        if (time.time() if now is None else now) < self._rl_until:
+            return None
         try:
             usage = self.client.fetch()
         except usage_api.NoCredentials:
@@ -1642,10 +1679,11 @@ class UsageApiSource:
         the idle poll and the armed confirm re-poll so neither hammers the
         rate-limited endpoint."""
         self._rl_streak += 1
+        retry_after = usage_api._parse_retry_after(retry_after)
         if retry_after:
             backoff = max(float(retry_after), 60.0)
         else:
-            backoff = min(60.0 * (2 ** (self._rl_streak - 1)), float(RL_BACKOFF_CAP))
+            backoff = min(60.0 * (2 ** min(self._rl_streak - 1, 10)), float(RL_BACKOFF_CAP))
         self._rl_until = time.time() + backoff
         return backoff
 
@@ -1656,7 +1694,7 @@ class UsageApiSource:
         if self._last_fetch and (now - self._last_fetch) < self._interval:
             return []                       # respect our own polling cadence
         self._last_fetch = now
-        usage = self._fetch()
+        usage = self._fetch(now=now)
         if usage is None:
             return []                       # error path already set the backoff
         # Success: clear any 429 backoff and poll again after the idle cadence.
@@ -1666,8 +1704,15 @@ class UsageApiSource:
         self._log_monitor_state(now)
         self._interval = float(self.normal)
         self._last_usage = usage
-        blocked = usage_api.find_blocked_quotas(usage)
-        return [self._to_hit(q) for q in blocked]
+        try:
+            blocked = usage_api.find_blocked_quotas(usage)
+            labels = sorted({q["label"] for q in usage_api.iter_quota_utilizations(usage)})
+        except (TypeError, ValueError, AttributeError, OverflowError):
+            self.log("usage-api: malformed quota data; waiting")
+            return []
+        return [dict(self._to_hit(q), quota_labels=labels,
+                     blocked_labels=sorted({b["label"] for b in blocked}))
+                for q in blocked]
 
     def armed_confirm_interval(self, remaining):
         """Adaptive network cadence while ARMED (fed the seconds until fire_at).
@@ -1678,23 +1723,39 @@ class UsageApiSource:
 
     def confirm_reset(self, pending, log):
         """RE-POLL at fire time: is the pending quota actually reset yet?"""
-        meta = pending.get("meta") or {"label": pending.get("kind")}
-        try:
-            usage = self.client.fetch()
-        except usage_api.RateLimited as e:
-            backoff = self._note_rate_limit(e.retry_after)
-            return False, (f"HTTP 429 at confirm (Retry-After={e.retry_after}); "
-                           f"backing off {int(backoff)}s")
-        except usage_api.UsageAPIError as e:
-            return False, f"confirm fetch failed ({e}); waiting"
-        # A successful confirm fetch clears any 429 backoff too.
+        if time.time() < self._rl_until:
+            return False, "waiting for Retry-After deadline"
+        usage = self._fetch()
+        self._last_fetch = time.time()
+        if usage is None:
+            return False, ("HTTP 429; waiting for Retry-After" if time.time() < self._rl_until
+                           else "confirm fetch unavailable; waiting")
         self._rl_streak = 0
         self._rl_until = 0.0
         self._last_usage = usage
-        if usage_api.is_quota_reset(usage, meta, below=self.confirm_below):
-            return True, f"utilization dropped below {self.confirm_below:g}%"
-        return False, (f"utilization still >= {self.confirm_below:g}%; "
-                       f"reset not applied yet")
+        self._interval = float(self.normal)
+        try:
+            quotas = list(usage_api.iter_quota_utilizations(usage))
+            labels = {q["label"] for q in quotas}
+            required = set(pending.get("quota_labels") or [])
+            required.add((pending.get("meta") or {}).get("label") or pending.get("kind"))
+            if not required <= labels:
+                return False, "quota data missing; waiting"
+            pending["quota_labels"] = sorted(required | labels)
+            blocked = usage_api.find_blocked_quotas(usage)
+            blocking_labels = set(pending.get("blocked_labels") or [])
+            blocking_labels.add((pending.get("meta") or {}).get("label") or pending.get("kind"))
+            blocking_labels.update(q["label"] for q in blocked)
+            pending["blocked_labels"] = sorted(blocking_labels)
+            if blocked:
+                return False, "still blocked: " + ", ".join(q["label"] for q in blocked)
+            if all(usage_api.is_quota_reset(usage, {"label": label},
+                                           below=self.confirm_below)
+                   for label in blocking_labels):
+                return True, f"all observed blockers below {self.confirm_below:g}%"
+        except (TypeError, ValueError, AttributeError, OverflowError):
+            return False, "malformed quota data; waiting"
+        return False, "reset not applied yet"
 
     def next_weekly_reset(self):
         """``(datetime, raw_str)`` of the weekly quota's next reset from the last
@@ -1755,20 +1816,67 @@ def select_source(args, log, creds_available=None):
 # --------------------------------------------------------------------------- #
 
 
+@contextmanager
+def preview_args(args):
+    """Simulate against temporary copies; never consume live state or controls."""
+    if not args.dry_run or getattr(args, "_preview_isolated", False):
+        yield args
+        return
+    with tempfile.TemporaryDirectory(prefix="autoresume-preview-") as directory:
+        preview = copy.copy(args)
+        preview._preview_isolated = True
+        preview.on_auth_expired = "log"
+        for attr, default in (("state_file", STATE_FILE), ("manual_file", MANUAL_FILE),
+                              ("stop_file", STOP_FILE)):
+            original = getattr(args, attr, default)
+            target = os.path.join(directory, attr)
+            if original and os.path.isfile(original):
+                shutil.copyfile(original, target)
+            setattr(preview, attr, target)
+        yield preview
+
+
+@contextmanager
+def watcher_lock(state_file):
+    """OS-owned lock: released on exit/crash, with no stale lock-file deletion."""
+    path = os.path.abspath(state_file) + ".lock"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a+b") as handle:
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        import msvcrt
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise RuntimeError("another watcher owns this state file") from exc
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def run_watch(args, shared=None, source=None):
+    with preview_args(args) as isolated:
+        with watcher_lock(isolated.state_file):
+            return _run_watch(isolated, shared=shared, source=source)
+
+
+def _run_watch(args, shared=None, source=None):
     """Detect a usage-limit block and auto-resume on reset (ARM-ON-HIT machine).
 
     Detection is delegated to a SOURCE (usage-api primary / transcript fallback,
     chosen per --source; injectable for tests). The loop:
 
-      * polls the source CONTINUOUSLY on a fast cadence -- for hits while idle,
-        and (via confirm_reset) for the armed window CLEARING while armed;
+      * polls adaptively for hits while idle and (via confirm_reset) for all
+        observed blocking windows CLEARING while armed;
       * ARMS the moment a hit is OBSERVED (percent >= 100) and PERSISTS the arm
         to the state file, so a restart resumes it and a reset that lands while
         the watcher is briefly down still fires;
-      * FIRES the resume when the armed window CLEARS (utilization dropped back
-        below the block line) OR the reset time is reached -- fires ONLY if a hit
-        was observed, so a window at 0% with no prior hit never fires;
+      * FIRES on confirmed quota clearance (or elapsed reset + buffer for the
+        transcript source), ONLY after a hit was observed;
       * also honours a MANUAL resume time (GUI / --resume-at) that fires at a set
         wall-clock time regardless of API detection.
 
@@ -1777,6 +1885,8 @@ def run_watch(args, shared=None, source=None):
     the GUI counts down to) and honours GUI requests (cancel / inject-now)
     without forking any detection/inject logic."""
     def publish(**kw):
+        if args.dry_run and kw.get("state") == "DONE":
+            kw["state"] = "PREVIEW"
         if shared is not None:
             shared.update(**kw)
 
@@ -1785,6 +1895,7 @@ def run_watch(args, shared=None, source=None):
         if shared is not None:
             shared.set_last_log(m)
 
+    completion = "PREVIEW simulated" if args.dry_run else "DONE submitted+recorded"
     src = source if source is not None else select_source(args, log)
     manual_file = getattr(args, "manual_file", MANUAL_FILE)
     # While ARMED, the fire-on-clear confirm re-poll cadence is ADAPTIVE: the
@@ -1796,7 +1907,7 @@ def run_watch(args, shared=None, source=None):
     # Fallback adaptive-cadence knobs for sources without armed_confirm_interval
     # (e.g. the transcript source / test doubles): fast near the reset, a slow
     # drift re-check far from it -- same shape as the usage-API source.
-    _confirm_fast_fb = max(1.0, min(float(armed_poll), float(USAGE_POLL_INTERVAL)))
+    _confirm_fast_fb = max(1.0, min(float(armed_poll), float(getattr(args, "confirm_interval", CONFIRM_INTERVAL))))
     _drift_fb = float(getattr(args, "armed_drift_recheck", ARMED_DRIFT_RECHECK))
     log(f"START autoresume v{__version__} source={src.label()} "
         f"buffer={args.buffer}s idle_poll={getattr(src, 'normal', armed_poll)}s "
@@ -1807,6 +1918,10 @@ def run_watch(args, shared=None, source=None):
     publish(state="WATCHING", stopped=bool(stop_path and os.path.exists(stop_path)))
 
     state = load_state(args.state_file)
+    delivery = state.get("delivery") or {}
+    if delivery.get("status") == "submitted":
+        mark_submitted(state, delivery["key"])
+        save_state(state, args.state_file)
     last_inject_time = 0.0
 
     # Restore a persisted arm (survives a restart; a reset missed during downtime
@@ -1821,6 +1936,8 @@ def run_watch(args, shared=None, source=None):
                 reset_epoch=pending.get("reset_epoch"), fire_at=pending["fire_at"])
     else:
         clear_arm(state, args.state_file)   # drop a stale/handled persisted arm
+    if delivery_needs_attention(state):
+        publish(state="ATTENTION", last_action="Delivery uncertain or prefilled; inspect conversation, then Cancel or Inject now")
 
     # CLI --resume-at seeds the shared manual-request file once (if in the future).
     ra_spec = getattr(args, "resume_at", None)
@@ -1842,7 +1959,7 @@ def run_watch(args, shared=None, source=None):
     kill_logged = False          # log kill-switch HOLD only on change (no spam)
     manual_hold_logged = False   # ditto for the manual HOLD
     confirm_wait_logged = False  # log confirm-wait only on change (no spam)
-    last_armed_confirm = 0.0     # last time we network-confirmed while armed
+    next_armed_confirm = 0.0    # absolute deadline; never compare elapsed to remaining
 
     def _session_workspace():
         """Resolve (session_id, workspace_title) for the URI injector. Explicit
@@ -1858,8 +1975,26 @@ def run_watch(args, shared=None, source=None):
         d_sid, d_ws = derive_session_and_workspace(args.watch_dir, tpath, log=log)
         return (sid or d_sid), (ws or d_ws)
 
-    def do_inject(kind, reset_str, early=False):
+    def complete_target(target):
+        return isinstance(target, dict) and all(
+            isinstance(target.get(field), str) and target[field].strip()
+            for field in ("session_id", "workspace_title"))
+
+    def repair_unresolved_target(binding):
+        # Only an explicit complete pair may repair a persisted unresolved target.
+        # Never rediscover a target or overwrite an already complete binding.
+        explicit_target = {"session_id": getattr(args, "session_id", None),
+                           "workspace_title": getattr(args, "workspace_title", None)}
+        if not complete_target(binding.get("target")) and complete_target(explicit_target):
+            binding["target"] = explicit_target
+            return True
+        return False
+
+    def do_inject(kind, reset_str, early=False, key=None, target=None, explicit=False):
         nonlocal last_inject_time
+        if (shared is not None and shared.shutdown.is_set()) or (
+                args.stop_file and os.path.exists(args.stop_file)):
+            return False
         # Tell the resumed agent how long until the WEEKLY limit resets again
         # (best-effort; only the usage-API source knows it). `early` flags an
         # UNEXPECTEDLY-EARLY reset (the quota cleared before its reported time).
@@ -1880,20 +2015,32 @@ def run_watch(args, shared=None, source=None):
         injector = args.injector
         session_id = workspace_title = None
         if injector == "uri":
-            session_id, workspace_title = _session_workspace()
-            if not session_id:
-                log("inject(uri): no session id derivable; falling back to "
-                    "--injector win32 (keystroke) for this fire")
-                injector = "win32"
+            if target is not None:
+                if complete_target(target):
+                    session_id, workspace_title = target["session_id"], target["workspace_title"]
+            else:
+                session_id, workspace_title = _session_workspace()
         if args.dry_run:
             if injector == "uri":
                 url = build_resume_uri(session_id, message)
                 log(f"DRY-RUN would inject via URI (session={session_id} "
                     f"workspace={workspace_title!r}): {url}")
+                log(f"PREVIEW message: {message}")
             else:
                 log(f"DRY-RUN would inject ({kind}) via {injector}: {message}")
             last_inject_time = time.time()
             return True
+        if injector == "uri" and not (session_id and workspace_title):
+            log("HOLD delivery: session/workspace missing; set --session-id and --workspace-title")
+            return False
+        if delivery_needs_attention(state) and not explicit:
+            log("HOLD uncertain delivery: inspect the conversation, then Cancel or Inject now")
+            publish(state="ATTENTION", last_action="Delivery uncertain; inspect conversation before retry")
+            return False
+        state["delivery"] = {"key": key or f"manual-now|{time.time()}",
+                             "status": "attempting", "started_at": time.time(),
+                             "target": {"session_id": session_id, "workspace_title": workspace_title}}
+        save_state(state, args.state_file)  # journal BEFORE any external effect
         if injector == "ahk":
             ok, detail = inject_via_ahk(message, args.ahk_exe, args.ahk_script, log)
         elif injector == "uri":
@@ -1908,9 +2055,27 @@ def run_watch(args, shared=None, source=None):
                 message, args.target_proc, args.target_title,
                 args.prefer_title, focus_method=args.focus_method, log=log)
         last_inject_time = time.time()
+        state["delivery"]["status"] = ("submitted" if ok else
+                                        "prefilled" if detail.startswith("prefilled")
+                                        else "not-submitted")
+        if ok:
+            mark_submitted(state, state["delivery"]["key"])
+        elif delivery_needs_attention(state):
+            publish(state="ATTENTION", last_action="Prompt prefilled but not submitted; inspect conversation, then Cancel or Inject now")
+        state["delivery"]["detail"] = detail
+        save_state(state, args.state_file)
         return ok
 
+    # Repair absent and incomplete persisted targets before attempting delivery.
+    if pending is not None and not complete_target(pending.get("target")):
+        if repair_unresolved_target(pending):
+            save_arm(state, pending, args.state_file)
+        elif args.injector == "uri":
+            log("HOLD unresolved arm: restart with --session-id and --workspace-title, or Cancel")
+
     while True:
+        if shared is not None and shared.shutdown.is_set():
+            return
         # Kill switch gates INJECTION only -- detection/logging keep running so
         # a hit that arrives while stopped is still recorded, and its pending
         # injection is HELD (not dropped) until the stop-file is removed.
@@ -1920,14 +2085,32 @@ def run_watch(args, shared=None, source=None):
         # GUI request: cancel the current pending reset (mark it handled so it
         # never fires and drop it + its persisted arm). No-op when idle.
         if shared is not None and shared.take_cancel():
-            if pending is not None:
-                log(f"CANCEL pending {pending['key']} by GUI request")
-                mark_handled(state, pending["key"])
-                clear_arm(state, args.state_file)      # also saves state
-                pending = None
+            held = state.get("delivery") or {}
+            cancel_key = held.get("key") if delivery_needs_attention(state) else (
+                pending["key"] if pending is not None else None)
+            if cancel_key:
+                log(f"CANCEL pending {cancel_key} by GUI request")
+                mark_handled(state, cancel_key)
+                cancelled = state.setdefault("cancelled", [])
+                if cancel_key not in cancelled:
+                    cancelled.append(cancel_key)
+                    del cancelled[:-200]
+                if held.get("key") == cancel_key:
+                    state["delivery"] = None
+                manual_request = read_manual_request(manual_file)
+                if manual_request and cancel_key == handled_key("manual", manual_request["resume_at"]):
+                    clear_manual_request(manual_file)
+                if pending is not None and pending["key"] == cancel_key:
+                    pending = None
+                    state["arm"] = None
+                save_state(state, args.state_file)
                 confirm_wait_logged = False
                 publish(state="WATCHING", fire_at=None, kind=None, reset_str=None,
                         reset_epoch=None, last_action="cancelled pending reset")
+                if pending is not None:
+                    publish(state="PENDING", fire_at=pending["fire_at"],
+                            kind=pending["kind"], reset_str=pending["reset_str"],
+                            reset_epoch=pending["reset_epoch"])
 
         # ---- Manual resume request (GUI / CLI shared file) ------------------- #
         manual = read_manual_request(manual_file)
@@ -1951,6 +2134,15 @@ def run_watch(args, shared=None, source=None):
         # ---- MANUAL FIRE: fire at the owner-set time regardless of detection -- #
         if manual is not None:
             m_fire = float(manual["resume_at"])
+            manual_key = handled_key("manual", m_fire)
+            binding = state.get("manual_target") or {}
+            if binding.get("key") != manual_key:
+                binding = {"key": manual_key,
+                           "target": dict(zip(("session_id", "workspace_title"), _session_workspace()))}
+                state["manual_target"] = binding
+                save_state(state, args.state_file)
+            elif repair_unresolved_target(binding):
+                save_state(state, args.state_file)
             if now >= m_fire:
                 mkey = f"manual|{int(round(m_fire / 60.0)) * 60}"
                 if is_handled(state, mkey):
@@ -1964,7 +2156,7 @@ def run_watch(args, shared=None, source=None):
                     manual_hold_logged = False
                     log(f"FIRE manual resume {mkey} (scheduled {_fmt_local(m_fire)})")
                     publish(state="FIRING")
-                    ok = do_inject("manual", _fmt_local(m_fire))
+                    ok = do_inject("manual", _fmt_local(m_fire), key=mkey, target=binding.get("target") or {})
                     if ok:
                         mark_handled(state, mkey)
                         clear_manual_request(manual_file)
@@ -1972,19 +2164,20 @@ def run_watch(args, shared=None, source=None):
                         pending = None
                         clear_arm(state, args.state_file)   # also saves state
                         confirm_wait_logged = False
-                        log(f"DONE injected+recorded {mkey}")
+                        log(f"{completion} {mkey}")
                         publish(state="DONE", fire_at=None,
                                 last_action=f"injected manual ({mkey})")
                     else:
-                        log(f"RETRY-LATER manual inject failed for {mkey}; "
-                            f"will retry next poll")
-                        publish(state="PENDING",
-                                last_action=f"manual inject failed for {mkey}; retrying")
+                        log(f"HOLD manual {mkey}: inspect delivery" if delivery_needs_attention(state)
+                            else f"RETRY-LATER manual not submitted for {mkey}")
+                        if not delivery_needs_attention(state):
+                            publish(state="PENDING",
+                                    last_action=f"manual not submitted for {mkey}; retrying")
 
         # ---- AUTO ARM: discover a block only while idle (and not manual-only) - #
         # Once armed we stop hunting for new hits and instead watch the armed
         # window for its CLEAR (below); the account stays limited until it resets.
-        if not manual_only and pending is None:
+        if not manual_only and pending is None and not delivery_needs_attention(state):
             for hit in src.poll():
                 kind = hit.get("kind")
                 reset_str = hit.get("reset_str")
@@ -2011,6 +2204,9 @@ def run_watch(args, shared=None, source=None):
                 log(f"DETECT {kind} limit; reset_reported={reset_str!r} "
                     f"resolved_local={local_str} key={key}")
                 now = time.time()
+                if key in state.get("cancelled", []) or key in state.get("submitted", []):
+                    log(f"SKIP cancelled/submitted {key}")
+                    continue
                 if is_handled(state, key):
                     # Normally once-per-reset dedup. BUT this hit means the quota
                     # is CURRENTLY blocked (>=100%). If its reset is still well in
@@ -2048,9 +2244,12 @@ def run_watch(args, shared=None, source=None):
                         "kind": kind, "reset_str": reset_str,
                         "reset_epoch": reset_epoch, "key": key, "fire_at": fire_at,
                         "meta": hit.get("meta"), "observed_at": now,
+                        "target": dict(zip(("session_id", "workspace_title"), _session_workspace())),
+                        "quota_labels": hit.get("quota_labels", []),
+                        "blocked_labels": hit.get("blocked_labels", []),
                     }
                     confirm_wait_logged = False
-                    last_armed_confirm = 0.0
+                    next_armed_confirm = 0.0
                     save_arm(state, pending, args.state_file)   # PERSIST the arm
                     log(f"ARM {key} at "
                         f"{datetime.fromtimestamp(fire_at).isoformat(timespec='seconds')} "
@@ -2066,7 +2265,10 @@ def run_watch(args, shared=None, source=None):
         # GUI "Inject now" with NO armed window (plain watching mode): the button
         # used to do nothing here, because the entire fire block below is gated on
         # `pending is not None`. Fire an immediate manual inject in that case.
-        if force_now and pending is None:
+        held_delivery = state.get("delivery") or {}
+        recover_other = (delivery_needs_attention(state) and
+                         (pending is None or pending["key"] != held_delivery.get("key")))
+        if force_now and (pending is None or recover_other):
             if stopped:
                 if not kill_logged:
                     log(f"HOLD inject-now: kill switch present at {args.stop_file}; "
@@ -2077,13 +2279,22 @@ def run_watch(args, shared=None, source=None):
                 kill_logged = False
                 log("FIRE inject-now (manual; no pending window)")
                 publish(state="FIRING")
-                ok = do_inject("manual", _fmt_local(time.time()))
+                retry_key = held_delivery.get("key") if recover_other else None
+                retry_target = held_delivery.get("target") if recover_other else None
+                ok = do_inject("manual", _fmt_local(time.time()), key=retry_key,
+                               target=retry_target, explicit=True)
+                if ok and manual is not None and retry_key == handled_key("manual", manual["resume_at"]):
+                    clear_manual_request(manual_file)
                 log("DONE inject-now injected" if ok
                     else "inject-now FAILED (injector returned False -- check the "
                          "target window title/proc and focus_method)")
                 publish(state="WATCHING",
                         last_action="manual inject-now" if ok
                         else "inject-now FAILED")
+                if pending is not None:
+                    publish(state="PENDING", fire_at=pending["fire_at"],
+                            kind=pending["kind"], reset_str=pending["reset_str"],
+                            reset_epoch=pending["reset_epoch"])
             force_now = False   # consumed; the pending branch handles pending!=None
 
         # ---- AUTO FIRE: fire when the armed window CLEARS or its time arrives - #
@@ -2102,13 +2313,17 @@ def run_watch(args, shared=None, source=None):
             confirm_iv = (armed_interval(remaining) if armed_interval is not None
                           else compute_armed_interval(remaining, _confirm_fast_fb,
                                                        _drift_fb))
-            confirm_due = (force_now or last_armed_confirm == 0.0
-                           or (now - last_armed_confirm) >= confirm_iv)
+            confirm_due = force_now or now >= next_armed_confirm
             if force_now:
                 fire, reason = True, "inject-now"
             elif confirm_due:
-                last_armed_confirm = now
                 confirmed, detail = src.confirm_reset(pending, log)
+                next_armed_confirm = max(
+                    now + (armed_interval(remaining) if armed_interval is not None else confirm_iv),
+                    float(getattr(src, "_rl_until", 0.0)))
+                if isinstance(src, TranscriptSource) and now < pending["fire_at"]:
+                    next_armed_confirm = min(next_armed_confirm, pending["fire_at"])
+                save_arm(state, pending, args.state_file)
                 if confirmed:
                     fire, reason = True, f"window cleared ({detail})"
                     confirm_wait_logged = False
@@ -2155,22 +2370,30 @@ def run_watch(args, shared=None, source=None):
                         + (" [EARLY]" if early_reset else ""))
                     publish(state="FIRING")
                     ok = do_inject(pending["kind"], pending["reset_str"],
-                                   early=early_reset)
+                                   early=early_reset, key=key,
+                                   target=pending.get("target") or {}, explicit=force_now)
                     if ok:
                         mark_handled(state, key)
                         clear_arm(state, args.state_file)   # also saves state
-                        log(f"DONE injected+recorded {key}")
+                        log(f"{completion} {key}")
                         publish(state="DONE", fire_at=None,
                                 last_action=f"injected {pending['kind']} ({key})")
                         pending = None
                         confirm_wait_logged = False
                     else:
-                        log(f"RETRY-LATER inject failed for {key}; "
-                            f"will retry next poll")
-                        publish(state="PENDING",
-                                last_action=f"inject failed for {key}; retrying")
+                        log(f"HOLD {key}: inspect delivery" if delivery_needs_attention(state)
+                            else f"RETRY-LATER not submitted for {key}")
+                        if not delivery_needs_attention(state):
+                            publish(state="PENDING",
+                                    last_action=f"not submitted for {key}; retrying")
 
-        time.sleep(src.loop_tick(pending, time.time(), args))
+        if delivery_needs_attention(state):
+            publish(state="ATTENTION", last_action="Delivery uncertain or prefilled; inspect conversation, then Cancel or Inject now")
+        delay = src.loop_tick(pending, time.time(), args)
+        if shared is not None and getattr(shared, "interruptible_wait", False):
+            shared.shutdown.wait(delay)
+        else:
+            time.sleep(delay)
 
 
 # --------------------------------------------------------------------------- #
@@ -2207,6 +2430,7 @@ class WatchStatus:
             "manual_resume_at": None,  # owner-set manual resume time (epoch) or None
             "manual_only": False,      # manual-only (auto-detection suppressed)
         }
+        self.shutdown = threading.Event()
         self._cancel = False
         self._inject_now = False
 
@@ -2304,7 +2528,13 @@ def derive_view(snap: dict, now: float) -> dict:
     elif state == "FIRING":
         status = "Injecting resume message…"
     elif state == "DONE":
-        status = "Injected. Watching for the next limit."
+        status = "Submit key sent (not acknowledged by Claude). Watching for the next limit."
+    elif state == "PREVIEW":
+        status = "Preview simulated; no submission or live state changes."
+    elif state == "ERROR":
+        status = "Watcher stopped: " + str(snap.get("last_action", "unknown error"))
+    elif state == "ATTENTION":
+        status = str(snap.get("last_action", "Delivery needs attention"))
     else:  # WATCHING
         status = "Watching — no limit hit yet"
 
@@ -2334,6 +2564,9 @@ _STATE_COLORS = {
     "FIRING": "#e06666",
     "DONE": "#7fbf7f",
     "HELD": "#e0a020",
+    "ATTENTION": "#e0a020",
+    "ERROR": "#e06666",
+    "PREVIEW": "#7fbf7f",
 }
 _BG = "#1e1e1e"
 _FG = "#d4d4d4"
@@ -2546,10 +2779,15 @@ def _watch_thread(args, shared: WatchStatus):
             log_event(f"WATCH-THREAD CRASHED: {e!r}", args.log_file)
         except Exception:
             pass
-        shared.update(state="DONE", last_action=f"watch loop crashed: {e!r}")
+        shared.update(state="ERROR", last_action=f"watch loop crashed: {e!r}")
 
 
 def run_gui(args):
+    with preview_args(args) as isolated:
+        return _run_gui(isolated)
+
+
+def _run_gui(args):
     """Start the watch loop in a background thread and show the status window."""
     if tk is None:
         log_event("GUI unavailable (tkinter not importable); running headless watch",
@@ -2557,20 +2795,33 @@ def run_gui(args):
         return run_watch(args)
 
     shared = WatchStatus()
-    t = threading.Thread(target=_watch_thread, args=(args, shared),
-                         name="autoresume-watch", daemon=True)
-    t.start()
-
+    shared.interruptible_wait = True
     root = tk.Tk()
-    win = StatusWindow(root, shared, args.stop_file,
-                       manual_file=getattr(args, "manual_file", MANUAL_FILE),
-                       tick_ms=1000)
-    win.start()
+    t = None
     try:
+        win = StatusWindow(root, shared, args.stop_file,
+                           manual_file=getattr(args, "manual_file", MANUAL_FILE),
+                           tick_ms=1000)
+        win.start()
+        t = threading.Thread(target=_watch_thread, args=(args, shared),
+                             name="autoresume-watch", daemon=True)
+        t.start()
         root.mainloop()
     except KeyboardInterrupt:
         pass
+    finally:
+        shared.shutdown.set()
+        if t is not None and t.ident is not None:
+            t.join()  # HTTP timeout bounds shutdown; retain preview files until exit
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
     return 0
+
+
+
+
 
 
 def cmd_install_shortcut(args):
@@ -2686,6 +2937,9 @@ def cmd_inject_now(args):
             press_enter=not args.no_enter,
             extra_enter=bool(getattr(args, "uri_extra_enter", False)), log=log)
     elif args.injector == "ahk":
+        if args.no_enter:
+            print("--no-enter is unsupported by the AHK adapter; no injection attempted")
+            return 1
         if getattr(args, "dry_run", False):
             print(f"inject ok=True detail=dry-run (ahk) message={args.message!r}")
             return 0
@@ -2699,7 +2953,7 @@ def cmd_inject_now(args):
             args.prefer_title, press_enter=not args.no_enter,
             focus_method=args.focus_method, log=log)
     print(f"inject ok={ok} detail={detail}")
-    return 0 if ok else 1
+    return 0 if ok or (args.no_enter and detail.startswith("prefilled")) else 1
 
 
 # --------------------------------------------------------------------------- #
@@ -2731,7 +2985,7 @@ def build_argparser():
                              "deep link to target the EXACT session tab, then one "
                              "Enter to submit; win32=legacy keystroke injector "
                              "(focus a window + type into the active tab); "
-                             "ahk=AutoHotkey v2 fallback")
+                             "ahk=disabled legacy adapter (no input sent)")
         sp.add_argument("--session-id", default=None,
                         help="uri injector: force this Claude Code session id "
                              "(default: derive from the newest/tailed transcript)")

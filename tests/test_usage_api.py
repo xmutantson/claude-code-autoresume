@@ -154,7 +154,7 @@ def _run_bounded(args, source, monkeypatch, start_epoch, max_sleeps=200):
     clock = FakeClock(start_epoch, max_sleeps=max_sleeps)
     monkeypatch.setattr(ar, "time", clock)
     try:
-        ar.run_watch(args, source=source)
+        ar._run_watch(args, source=source)
     except StopLoop:
         pass
     with open(args.log_file, encoding="utf-8") as fh:
@@ -224,7 +224,7 @@ def test_blocked_then_reset_injects_once(tmp_path, monkeypatch):
     args = _make_watch_args(tmp_path)
     log, clock = _run_bounded(args, src, monkeypatch, start, max_sleeps=100)
     assert log.count("DRY-RUN would inject") == 1, log
-    assert "DONE injected+recorded" in log
+    assert "PREVIEW simulated" in log
     # confirm was polled at least twice: once (not reset) then once (reset).
     assert src.confirm_calls >= 2
 
@@ -240,7 +240,7 @@ def test_run_watch_resolves_source_when_none(tmp_path, monkeypatch):
     clock = FakeClock(start, max_sleeps=100)
     monkeypatch.setattr(ar, "time", clock)
     try:
-        ar.run_watch(args)          # NOTE: no source= -> exercises select_source
+        ar._run_watch(args)          # NOTE: no source= -> exercises select_source
     except StopLoop:
         pass
     with open(args.log_file, encoding="utf-8") as fh:

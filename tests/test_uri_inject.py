@@ -176,7 +176,7 @@ def test_inject_via_uri_no_enter_leaves_prompt_prefilled(wired):
     ok, detail = ar.inject_via_uri(
         "msg", "SID-9", "myrepo", press_enter=False,
         shell_execute=wired["fire"], log=lambda m: None)
-    assert ok is True and detail.startswith("prefilled")
+    assert ok is False and detail.startswith("prefilled")
     assert len(wired["fired"]) == 1
     assert wired["enters"] == []           # Enter suppressed
 
@@ -190,7 +190,7 @@ def test_inject_via_uri_guard_holds_enter_when_fg_not_vscode(wired):
     ok, detail = ar.inject_via_uri(
         "msg", "SID-9", "myrepo",
         shell_execute=wired["fire"], log=lambda m: None)
-    assert ok is True and detail.startswith("prefilled-not-submitted")
+    assert ok is False and detail.startswith("prefilled-not-submitted")
     assert len(wired["fired"]) == 1
     assert wired["enters"] == []           # NEVER Enter into a non-VS-Code window
 
