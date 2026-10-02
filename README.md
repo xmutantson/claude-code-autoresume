@@ -239,8 +239,12 @@ What autoresume does for each pending event:
 - `--dry-run` (watch) and `inject-now --dry-run` **log the exact URI** without
   firing it — verify the `session=` and url-encoded `prompt=` before going live.
 
-`--injector win32` restores the legacy keystroke path below; `--injector ahk`
-uses the AutoHotkey fallback.
+`--injector win32` restores the legacy keystroke path below. The legacy
+`--injector ahk` adapter is disabled: it returns `ahk-disabled` without launching
+any process, and `inject.ahk` exits with code 5 without activating a window or
+sending input. It could not verify the configured workspace, session, and Claude
+input. Configure the default URI injector instead; pending requests remain
+unsubmitted until an enabled injector succeeds.
 
 ### `--injector win32` — legacy keystroke path *(fallback)*
 
@@ -330,6 +334,13 @@ Fail-safes, all implemented:
   the OAuth token is never logged, printed, or stored.
 - **Full logging** of every poll decision (quota, percent, resolved reset) and
   every action (target window title + why, injected/held/aborted-and-why).
+
+A persisted automatic or manual request with a missing or incomplete target can
+be repaired by restarting with **both** `--session-id` and `--workspace-title`.
+The complete explicit pair is saved before delivery. An already complete target
+remains bound to its original session/workspace, even if restart options differ.
+Partial options and newly discovered transcripts cannot repair a persisted
+unresolved target; delivery stays held until an explicit complete pair is given.
 
 State, log, kill-switch, and manual-request locations:
 

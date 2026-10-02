@@ -54,8 +54,8 @@ AutoHotkey hack) with limit-aware detection, focused-window targeting,
 send-once-per-reset dedup, a kill switch, and full logging.
 
 Design: detection/schedule/dedup in Python (stdlib: json + datetime + urllib +
-zoneinfo/tzdata); injection via pure Win32 SendInput (no third-party deps). An
-AHK v2 fallback injector (inject.ahk) is provided as an alternative.
+zoneinfo/tzdata); injection via pure Win32 SendInput (no third-party deps).
+The legacy AHK injector is disabled because it cannot verify the target input.
 
 No external Python packages are required beyond the standard library plus
 `tzdata` (already present) for zoneinfo on Windows.
@@ -857,16 +857,10 @@ def inject_message(message: str, proc_name=TARGET_PROC, title_substr=TARGET_TITL
 
 
 def inject_via_ahk(message: str, ahk_exe: str, ahk_script: str, log=None):
-    """Fallback injector: shell out to inject.ahk (AutoHotkey v2)."""
-    import subprocess
-    if not (os.path.isfile(ahk_exe) and os.path.isfile(ahk_script)):
-        if log:
-            log(f"ABORT inject(ahk): missing exe/script ({ahk_exe} / {ahk_script})")
-        return False, "ahk-missing"
-    rc = subprocess.call([ahk_exe, ahk_script, message], creationflags=_NO_WINDOW)
+    """Disabled: the legacy script cannot verify the configured Claude input."""
     if log:
-        log(f"inject(ahk) rc={rc}")
-    return rc == 0, f"ahk-rc-{rc}"
+        log("HOLD delivery: AHK injector disabled; use the configured URI injector")
+    return False, "ahk-disabled"
 
 
 # --------------------------------------------------------------------------- #
@@ -1981,6 +1975,21 @@ def _run_watch(args, shared=None, source=None):
         d_sid, d_ws = derive_session_and_workspace(args.watch_dir, tpath, log=log)
         return (sid or d_sid), (ws or d_ws)
 
+    def complete_target(target):
+        return isinstance(target, dict) and all(
+            isinstance(target.get(field), str) and target[field].strip()
+            for field in ("session_id", "workspace_title"))
+
+    def repair_unresolved_target(binding):
+        # Only an explicit complete pair may repair a persisted unresolved target.
+        # Never rediscover a target or overwrite an already complete binding.
+        explicit_target = {"session_id": getattr(args, "session_id", None),
+                           "workspace_title": getattr(args, "workspace_title", None)}
+        if not complete_target(binding.get("target")) and complete_target(explicit_target):
+            binding["target"] = explicit_target
+            return True
+        return False
+
     def do_inject(kind, reset_str, early=False, key=None, target=None, explicit=False):
         nonlocal last_inject_time
         if (shared is not None and shared.shutdown.is_set()) or (
@@ -2007,7 +2016,8 @@ def _run_watch(args, shared=None, source=None):
         session_id = workspace_title = None
         if injector == "uri":
             if target is not None:
-                session_id, workspace_title = target.get("session_id"), target.get("workspace_title")
+                if complete_target(target):
+                    session_id, workspace_title = target["session_id"], target["workspace_title"]
             else:
                 session_id, workspace_title = _session_workspace()
         if args.dry_run:
@@ -2056,13 +2066,12 @@ def _run_watch(args, shared=None, source=None):
         save_state(state, args.state_file)
         return ok
 
-    # Legacy arms have no target: migrate only from an explicit complete choice.
-    if pending is not None and not pending.get("target"):
-        if getattr(args, "session_id", None) and getattr(args, "workspace_title", None):
-            pending["target"] = {"session_id": args.session_id, "workspace_title": args.workspace_title}
+    # Repair absent and incomplete persisted targets before attempting delivery.
+    if pending is not None and not complete_target(pending.get("target")):
+        if repair_unresolved_target(pending):
             save_arm(state, pending, args.state_file)
         elif args.injector == "uri":
-            log("HOLD legacy arm: restart with --session-id and --workspace-title, or Cancel")
+            log("HOLD unresolved arm: restart with --session-id and --workspace-title, or Cancel")
 
     while True:
         if shared is not None and shared.shutdown.is_set():
@@ -2132,6 +2141,8 @@ def _run_watch(args, shared=None, source=None):
                            "target": dict(zip(("session_id", "workspace_title"), _session_workspace()))}
                 state["manual_target"] = binding
                 save_state(state, args.state_file)
+            elif repair_unresolved_target(binding):
+                save_state(state, args.state_file)
             if now >= m_fire:
                 mkey = f"manual|{int(round(m_fire / 60.0)) * 60}"
                 if is_handled(state, mkey):
@@ -2145,7 +2156,7 @@ def _run_watch(args, shared=None, source=None):
                     manual_hold_logged = False
                     log(f"FIRE manual resume {mkey} (scheduled {_fmt_local(m_fire)})")
                     publish(state="FIRING")
-                    ok = do_inject("manual", _fmt_local(m_fire), key=mkey, target=binding["target"])
+                    ok = do_inject("manual", _fmt_local(m_fire), key=mkey, target=binding.get("target") or {})
                     if ok:
                         mark_handled(state, mkey)
                         clear_manual_request(manual_file)
@@ -2974,7 +2985,7 @@ def build_argparser():
                              "deep link to target the EXACT session tab, then one "
                              "Enter to submit; win32=legacy keystroke injector "
                              "(focus a window + type into the active tab); "
-                             "ahk=AutoHotkey v2 fallback")
+                             "ahk=disabled legacy adapter (no input sent)")
         sp.add_argument("--session-id", default=None,
                         help="uri injector: force this Claude Code session id "
                              "(default: derive from the newest/tailed transcript)")
